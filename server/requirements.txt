@@ -1,0 +1,10 @@
+fastapi>=0.115
+uvicorn>=0.30
+numpy>=1.26
+opencv-python-headless>=4.10
+pillow>=10.4
+pillow-heif>=0.18
+onnxruntime-gpu[cuda,cudnn]==1.26.0  # 1.27+ 는 CUDA 13(드라이버 580+) 필요
+# 드라이버 560(CUDA 12.6)에서 PTX JIT 호환을 위해 12.6 으로 고정
+nvidia-cuda-nvrtc-cu12==12.6.85
+nvidia-nvjitlink-cu12==12.6.85
