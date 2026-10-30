@@ -7,7 +7,9 @@ const HINTS: Record<string, string> = {
   zoom: "클릭: 확대 · Alt+클릭: 축소",
   marquee: "드래그: 선택 · Shift: 더하기/정사각형 · Alt: 빼기 · 클릭: 선택 해제",
   lasso: "자유: 드래그 · 다각형: 클릭으로 점 찍고 더블클릭으로 닫기 · Shift 더하기 · Alt 빼기",
-  wand: "클릭: 비슷한 색 선택 · Shift 더하기 · Alt 빼기",
+  wand: "클릭: 비슷한 색 선택 · Shift 더하기 · Alt 빼기 · 끌기: 문질러 선택에서 빼기 (Shift+끌기 더하기)",
+  colorrange: "클릭: 사진 전체에서 비슷한 색 선택 · Shift 더하기 · 끌기: 문질러 선택에서 빼기 · Delete 지우기",
+  bgpick: "클릭: 그곳과 이어진 배경 지우기",
   pen: "클릭: 직선 점 · 드래그: 곡선 · 첫 점: 닫기 · Enter: 선택 영역으로",
   brush: "[ ]: 크기 · Shift+[ ]: 경도 · X: 복원/지우기 전환",
   crop: "모서리를 끌어 영역 조절 · Enter: 적용 · Esc: 취소",
@@ -33,9 +35,9 @@ export function StatusBar() {
   const dev = server?.device;
   const led = !server ? "warn" : !server.ok ? "err" : dev?.kind === "cpu" ? "warn" : "ok";
   const devText = !server
-    ? "AI 서버 확인 중…"
+    ? "서버 확인 중…"
     : !server.ok
-      ? "AI 서버 연결 안 됨 (누끼 불가)"
+      ? "서버 연결 안 됨 (누끼 불가)"
       : `${dev?.label ?? ""}${dev?.gpu ? ` · ${dev.gpu}` : ""}`;
 
   return (
@@ -57,6 +59,7 @@ export function StatusBar() {
         </>
       )}
       <div className="spacer" />
+      <span className="build-tag" data-tip="화면 버전 (빌드 시각)" data-tip-pos="top">v{__BUILD__}</span>
       <div className="status-dev">
         <span className={`led ${led}`} />
         {devText}

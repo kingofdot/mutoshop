@@ -7,6 +7,7 @@ export function ToolOverlay() {
   const d = useDraft((s) => s.d);
   const path = useStore((s) => s.penPath);
   const tool = useStore((s) => s.tool);
+  const seeds = useStore((s) => s.doc.cutout?.seeds);
   // 화면 이동/확대·회전 시 다시 그리도록 구독
   useStore((s) => s.view);
   useStore((s) => s.doc.orient);
@@ -52,6 +53,10 @@ export function ToolOverlay() {
       {shape}
       {path && tool === "pen" && <PenView path={path} P={P} />}
       {path && tool !== "pen" && <PenView path={path} P={P} dim />}
+      {tool === "bgpick" && seeds?.map(([x, y], i) => {
+        const [a, b] = P(x + 0.5, y + 0.5);
+        return <circle key={i} cx={a} cy={b} r={5} fill="#ff4d7a" stroke="#fff" strokeWidth={1.5} />;
+      })}
     </svg>
   );
 }

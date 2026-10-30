@@ -8,3 +8,5 @@ onnxruntime-gpu[cuda,cudnn]==1.26.0  # 1.27+ 는 CUDA 13(드라이버 580+) 필�
 # 드라이버 560(CUDA 12.6)에서 PTX JIT 호환을 위해 12.6 으로 고정
 nvidia-cuda-nvrtc-cu12==12.6.85
 nvidia-nvjitlink-cu12==12.6.85
+onnx>=1.17  # 메모리 절약 모드: 모델을 나눠 저장할 때만 씀
+pywebview>=5.3  # 프로그램 창 (WebView2) — Ctrl+W 가 창을 닫지 않게

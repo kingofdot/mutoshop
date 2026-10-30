@@ -62,6 +62,8 @@ export interface EdgeParams {
   defringe: number;
   /** 투명도 다시 계산 (색 기준, 0..100) — 배경색과 피사체 색으로 경계의 투명도를 새로 구함 */
   colorAlpha: number;
+  /** 테두리 깎기 (px, 0..50) — 피사체 바깥 가장자리를 1px 씩 깎는다. 외곽선을 너무 두껍게 넣은 사진 고치기 */
+  shave: number;
 }
 
 export type BgMode = "original" | "transparent" | "color" | "blur" | "image";
@@ -138,6 +140,16 @@ export interface Cutout {
   maskId: string;
   fgId: string | null; // null 이면 원본 색 사용
   source: "ai" | "alpha" | "manual";
+  /** 누끼 따기로 만든 결과의 종류 (투명 PNG·직접 만든 마스크는 없음) */
+  kind?: CutKind;
+  /** 잔티 제거 전의 마스크 (잔티 제거를 끄면 이것으로 되돌린다) */
+  rawMaskId?: string;
+  /** 잔티 제거로 지운 점 개수 */
+  specks?: number;
+  /** '배경 찍기'로 찍은 자리 (원본 px). 다음에 찍으면 여기에 더해 다시 딴다 */
+  seeds?: [number, number][];
+  /** 찍기와 함께 사진 테두리의 배경도 자동으로 지웠는지 (자동 누끼 결과 위에 찍었을 때) */
+  border?: boolean;
 }
 
 export interface Doc {
@@ -205,6 +217,7 @@ export const defaultEffects = (): Effects => ({ clarity: 0, sharpen: 0, vignette
 
 export const defaultEdge = (): EdgeParams => ({
   feather: 0, contrast: 0, shift: 0, decontaminate: 100, deconMode: "auto", matteSource: "auto", matteColor: "#ffffff", defringe: 0, colorAlpha: 0,
+  shave: 0,
 });
 
 export const defaultBackground = (): Background => ({
@@ -224,11 +237,14 @@ export const defaultShadow = (): Shadow => ({
   color: "#000000",
 });
 
+/** 외곽선 기본 두께: 가로·세로 모두 1024px 이하인 사진은 1px, 그보다 크면 2px */
+export const defaultOutlineWidth = (w: number, h: number) => (Math.max(w, h) <= 1024 ? 1 : 2);
+
 export const defaultOutline = (): Outline => ({
   enabled: false,
-  position: "outside",
-  width: 16,
-  fill: "gradient",
+  position: "center",
+  width: 2,
+  fill: "solid",
   color: "#000000",
   color2: "#000000",
   alpha1: 100,
@@ -273,6 +289,11 @@ export function adjustIsIdentity(a: AdjustSet): boolean {
   if (a.hsl.some((b) => b.h || b.s || b.l)) return false;
   return !curvesActive(a.curves);
 }
+
+/** 누끼 종류: 고른 종류에 맞춰 피사체를 지키는 방식이 달라진다 (server/assetcut.py 의 KINDS 와 같음) */
+export type CutKind = "tree" | "mountain" | "item" | "person";
+/** 피사체 안쪽에 갇힌 배경색: auto=종류대로 · keep=하나도 안 지움 · remove=갇힌 구멍도 지움 */
+export type Inner = "auto" | "keep" | "remove";
 
 export function outputSize(w: number, h: number, o: Orient): [number, number] {
   return o.rot % 2 === 1 ? [h, w] : [w, h];

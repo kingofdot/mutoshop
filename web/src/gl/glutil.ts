@@ -1,6 +1,10 @@
 // WebGL2 보조 도구: 프로그램, 텍스처, 렌더 타깃(FBO)
 
-export type Fmt = "r8" | "rgba8" | "rgba16f" | "rgba32f";
+// rg16ui: 부호 없는 16비트 정수 2개 (테두리 거리장의 좌표용 — 실수보다 4배 작고 확장 기능 없이도 렌더 가능)
+export type Fmt = "r8" | "rg8" | "rgba8" | "rgba16f" | "rgba32f" | "rg16ui";
+
+/** 픽셀당 바이트 (메모리 점검용) */
+export const FMT_BYTES: Record<Fmt, number> = { r8: 1, rg8: 2, rgba8: 4, rgba16f: 8, rgba32f: 16, rg16ui: 4 };
 
 export class Program {
   readonly prog: WebGLProgram;
@@ -90,6 +94,10 @@ function formatInfo(gl: WebGL2RenderingContext, fmt: Fmt) {
   switch (fmt) {
     case "r8":
       return { internal: gl.R8, format: gl.RED, type: gl.UNSIGNED_BYTE };
+    case "rg8":
+      return { internal: gl.RG8, format: gl.RG, type: gl.UNSIGNED_BYTE };
+    case "rg16ui":
+      return { internal: gl.RG16UI, format: gl.RG_INTEGER, type: gl.UNSIGNED_SHORT };
     case "rgba16f":
       return { internal: gl.RGBA16F, format: gl.RGBA, type: gl.HALF_FLOAT };
     case "rgba32f":
@@ -113,8 +121,8 @@ export function createTexture(
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
   gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, data);
   setFilter(gl, mips);
-  if (fmt === "rgba32f") {
-    // 32비트 실수는 선형 필터가 기본 지원되지 않으므로(텍스처 불완전) 최근접으로
+  if (fmt === "rgba32f" || fmt === "rg16ui") {
+    // 32비트 실수·정수 텍스처는 선형 필터가 안 되므로(텍스처 불완전) 최근접으로
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   }

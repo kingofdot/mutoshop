@@ -4,3 +4,4 @@ web/node_modules/
 server/models/*.onnx
 server/models/*.part
 web/tsconfig.tsbuildinfo
+server/models/*.lowmem/

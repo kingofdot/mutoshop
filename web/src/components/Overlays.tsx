@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { activateWindow } from "../lib/host";
 import { AlertCircle, CheckCircle2, Info, X } from "lucide-react";
 import { useDialog } from "../dialog";
 import { useStore } from "../store";
@@ -37,7 +38,7 @@ export function ConfirmDialog() {
         <div className="modal-head">
           <h3>{cur.title}</h3>
         </div>
-        {cur.body && <div className="modal-body" style={{ color: "var(--t2)" }}>{cur.body}</div>}
+        {cur.body && <div className="modal-body" style={{ color: "var(--t2)", whiteSpace: "pre-line", wordBreak: "break-all" }}>{cur.body}</div>}
         <div className="modal-foot" style={{ justifyContent: "flex-end" }}>
           <button className="btn" onClick={() => cur.resolve(false)}>{cur.cancel ?? "취소"}</button>
           <button className={`btn primary`} autoFocus onClick={() => cur.resolve(true)}>{cur.ok ?? "확인"}</button>
@@ -48,7 +49,7 @@ export function ConfirmDialog() {
 }
 
 /** 파일을 창 위로 끌고 오면 표시 */
-export function DragOverlay({ onFile }: { onFile: (f: File) => void }) {
+export function DragOverlay({ onFile }: { onFile: (f: File, handle?: Promise<unknown> | null) => void }) {
   const [over, setOver] = useState(false);
   useEffect(() => {
     let depth = 0;
@@ -74,8 +75,23 @@ export function DragOverlay({ onFile }: { onFile: (f: File) => void }) {
       e.preventDefault();
       depth = 0;
       setOver(false);
-      const f = [...(e.dataTransfer?.files ?? [])].find((x) => x.type.startsWith("image/") || /\.(heic|heif|avif|bmp|tiff?)$/i.test(x.name));
-      if (f) onFile(f);
+      activateWindow(); // 끌어다 놓으면 탐색기 대신 MUTOSHOP 이 활성 창이 되게
+      const isImg = (x: File) => x.type.startsWith("image/") || /\.(heic|heif|avif|bmp|tiff?)$/i.test(x.name);
+      // 파일 핸들은 이 이벤트 안에서만 받을 수 있다 (원본 덮어쓰기용)
+      let f: File | null = null;
+      let handle: Promise<unknown> | null = null;
+      for (const it of [...(e.dataTransfer?.items ?? [])]) {
+        if (it.kind !== "file") continue;
+        const x = it.getAsFile();
+        if (x && isImg(x)) {
+          f = x;
+          const g = (it as unknown as { getAsFileSystemHandle?: () => Promise<unknown> }).getAsFileSystemHandle;
+          handle = g ? g.call(it) : null;
+          break;
+        }
+      }
+      if (!f) f = [...(e.dataTransfer?.files ?? [])].find(isImg) ?? null;
+      if (f) onFile(f, handle);
       else useStore.getState().toast("이미지 파일만 열 수 있어요.", "error");
     };
     window.addEventListener("dragenter", enter);
@@ -102,7 +118,7 @@ const SHORTCUTS: [string, string][] = [
   ["Ctrl+V", "클립보드 이미지 붙여넣기"],
   ["Ctrl+S", "내보내기"],
   ["Ctrl+Shift+C", "결과를 클립보드에 복사"],
-  ["Ctrl+Z / Ctrl+Shift+Z", "실행 취소 / 다시 실행"],
+  ["Ctrl+Z / Ctrl+Shift+Z", "실행 취소 / 다시 실행 (선택도 한 단계씩)"],
   ["H", "손 도구"],
   ["Space + 드래그", "어느 도구에서든 화면 이동"],
   ["Z", "돋보기"],
@@ -124,9 +140,10 @@ const SHORTCUTS: [string, string][] = [
   ["Shift+[ / ]", "브러시 경도"],
   ["Alt+우클릭 드래그", "브러시 크기·경도 조절"],
   ["Ctrl+I", "마스크 반전"],
-  ["F", "누끼 확인 보기 전환"],
+  ["F / A", "누끼 확인 보기 전환 (오른쪽 / 왼쪽)"],
   ["\\ (누르고 있기)", "원본 보기"],
-  ["C", "자르기 · 회전"],
+  ["C", "색 범위 (비슷한 색 전부 선택 → Delete)"],
+  ["Shift+C", "자르기 · 회전"],
   ["Enter / Esc", "자르기 적용 / 취소"],
   ["I", "스포이드 (배경색)"],
   ["슬라이더 더블클릭", "기본값으로"],

@@ -1,4 +1,5 @@
 import {
+  FMT_BYTES,
   Program,
   bindTarget,
   createTexture,
@@ -46,14 +47,34 @@ const BG_MODE = { original: 0, transparent: 1, color: 2, blur: 3, image: 4 } as 
 const WORKSPACE: [number, number, number] = [0.086, 0.09, 0.1];
 const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
 
+/** 렌더 타깃 필드 전체 */
+const TARGETS = [
+  "work", "refined", "rA", "rB", "bgA", "bgB", "shA", "shB", "frA", "frB", "mtA", "mtB", "refA", "refB",
+  "rnA", "rnB", "thA", "thB", "thC", "thD", "roiA", "roiB", "kA", "kB", "jfA", "jfB", "calpha",
+  "clA", "clB", "comp", "fxT", "small", "smallFx", "histT", "svA", "svB",
+] as const;
+type TargetKey = (typeof TARGETS)[number];
+/** 계산하는 동안에만 쓰는 중간 타깃 (결과는 다른 타깃에 남는다) — 한동안 쓰지 않으면 내려놓는다.
+ *  (테두리 거리장 jfA/jfB 는 결과가 든 쪽만 남긴다) */
+const SCRATCH: readonly TargetKey[] = [
+  "rA", "rB", "bgB", "shB", "frB", "mtB", "refA", "refB", "rnB", "thA", "thB", "thC", "thD", "roiA", "roiB",
+  "kA", "kB", "clA", "clB", "svB",
+];
+/** 마지막 계산 뒤 이만큼(ms) 아무 계산도 없으면 중간 타깃을 내려놓는다 */
+const SCRATCH_IDLE_MS = 4000;
+/** 테두리 거리장을 절반 해상도로 계산하는 크기 (원본 px 수). 그 이하는 원본 해상도 그대로 */
+const OUTLINE_HALF_RES = 6e6;
+
 export class Renderer {
   readonly gl: WebGL2RenderingContext;
-  private p: Record<"copy" | "orient" | "down" | "bgprep" | "blur" | "refine" | "stamp" | "region" | "fringe" | "calpha" | "morph" | "key" | "max2" | "jfaInit" | "jfaStep" | "comp" | "fx" | "display", Program>;
+  private p: Record<"copy" | "orient" | "down" | "bgprep" | "blur" | "refine" | "stamp" | "region" | "fringe" | "calpha" | "morph" | "erode" | "key" | "max2" | "jfaInit" | "jfaStep" | "comp" | "fx" | "display", Program>;
   private quad: WebGLVertexArrayObject;
   private stampVao: WebGLVertexArrayObject;
   private instBuf: WebGLBuffer;
   private white: WebGLTexture;
   private clear: WebGLTexture;
+  /** 정수 샘플러(테두리 거리장) 자리에 끼울 빈 텍스처 */
+  private clearU: WebGLTexture;
   private lut: WebGLTexture;
   private lutThumb: WebGLTexture;
   private lutData = new Uint8Array(256 * 3 * 4);
@@ -70,6 +91,9 @@ export class Renderer {
 
   private work: Target | null = null;
   private refined: Target | null = null;
+  /** 테두리 깎기 결과 (svB 는 계산용) */
+  private svA: Target | null = null;
+  private svB: Target | null = null;
   private rA: Target | null = null;
   private rB: Target | null = null;
   private bgA: Target | null = null;
@@ -96,6 +120,8 @@ export class Renderer {
   private jfA: Target | null = null;
   private jfB: Target | null = null;
   private distT: Target | null = null;
+  /** 거리장 1픽셀 = 원본 몇 px */
+  private distF = 1;
   private calpha: Target | null = null;
   private calphaValid = false;
   private shB: Target | null = null;
@@ -123,6 +149,9 @@ export class Renderer {
   private params = new Float32Array(3 * SET_VEC4 * 4);
   private d = { mask: true, matte: true, calpha: true, refine: true, fringe: true, outline: true, bgBlur: true, shadow: true, comp: true };
   private raf = 0;
+  private idleTimer = 0;
+  /** trim() 뒤: 화면에는 마지막 결과만 보여 주고, 무엇이 바뀌기 전까지 다시 계산하지 않는다 */
+  private trimmed = false;
 
   onComposite?: () => void;
   onLost?: () => void;
@@ -158,6 +187,7 @@ export class Renderer {
       fringe: new Program(gl, S.VS_QUAD, S.FS_FRINGEPREP),
       calpha: new Program(gl, S.VS_QUAD, S.FS_CALPHA),
       morph: new Program(gl, S.VS_QUAD, S.FS_MORPH),
+      erode: new Program(gl, S.VS_QUAD, S.FS_ERODE),
       key: new Program(gl, S.VS_QUAD, S.FS_KEY),
       max2: new Program(gl, S.VS_QUAD, S.FS_MAX2),
       jfaInit: new Program(gl, S.VS_QUAD, S.FS_JFA_INIT),
@@ -189,6 +219,7 @@ export class Renderer {
 
     this.white = createTexture(gl, 1, 1, "rgba8", new Uint8Array([255, 255, 255, 255]));
     this.clear = createTexture(gl, 1, 1, "rgba8", new Uint8Array([0, 0, 0, 0]));
+    this.clearU = createTexture(gl, 1, 1, "rg16ui", new Uint16Array([0, 0xffff]));
     const ident = new Uint8Array(256 * 3 * 4);
     for (let r = 0; r < 3; r++) for (let i = 0; i < 256; i++) ident.fill(i, (r * 256 + i) * 4, (r * 256 + i) * 4 + 4);
     this.lut = createTexture(gl, 256, 3, "rgba8", ident);
@@ -199,6 +230,7 @@ export class Renderer {
   // 상태 동기화
 
   sync(doc: Doc | null) {
+    this.trimmed = false;
     const src = resources.source;
     if (!src || !doc) {
       if (this.src) this.resetImage();
@@ -211,7 +243,7 @@ export class Renderer {
     if (!p || doc.cutout !== p.cutout || doc.strokes !== p.strokes) this.d.mask = true;
     if (!p || doc.edge !== p.edge || doc.invert !== p.invert) {
       if (!p || doc.edge.feather !== p.edge.feather || doc.edge.shift !== p.edge.shift ||
-          doc.edge.contrast !== p.edge.contrast || doc.invert !== p.invert) this.d.refine = true;
+          doc.edge.contrast !== p.edge.contrast || doc.invert !== p.invert || doc.edge.shave !== p.edge.shave) this.d.refine = true;
       if (!p || doc.edge.defringe !== p.edge.defringe || doc.invert !== p.invert) this.d.fringe = true;
       if (!p || doc.edge.deconMode !== p.edge.deconMode || doc.edge.matteSource !== p.edge.matteSource ||
           doc.edge.colorAlpha !== p.edge.colorAlpha || doc.invert !== p.invert) this.d.matte = true;
@@ -242,6 +274,7 @@ export class Renderer {
 
   setView(v: DisplayState) {
     this.view = v;
+    this.trimmed = false;
     this.request();
   }
 
@@ -252,14 +285,19 @@ export class Renderer {
   private frame() {
     this.raf = 0;
     if (this.lost) return;
-    const composed = this.flush();
+    const composed = this.trimmed ? false : this.flush();
     this.drawDisplay();
     if (composed) this.onComposite?.();
   }
 
   /** 밀린 계산을 모두 처리. 합성을 새로 했으면 true */
   private flush(): boolean {
+    this.trimmed = false;
     if (!this.src || !this.doc) return false;
+    const d = this.d;
+    if (d.mask || d.matte || d.calpha || d.refine || d.fringe || d.outline || d.bgBlur || d.shadow || d.comp) {
+      this.scheduleScratchRelease();
+    }
     // 마스크 → 주변 배경색 → 투명도 다시 계산 → 가장자리 다듬기 → (색 채우기·배경 흐림·그림자) → 합성
     if (this.d.mask) this.updateMask();
     if (this.d.matte) {
@@ -309,10 +347,7 @@ export class Renderer {
     this.maskTex.clear();
     this.fgTex.clear();
     this.bgTex.clear();
-    for (const k of ["work", "refined", "rA", "rB", "bgA", "bgB", "shA", "shB", "clA", "clB", "comp", "fxT", "frA", "frB", "mtA", "mtB", "refA", "refB", "rnA", "rnB", "calpha", "thA", "thB", "thC", "thD", "roiA", "roiB", "kA", "kB", "jfA", "jfB"] as const) {
-      deleteTarget(gl, this[k]);
-      this[k] = null;
-    }
+    this.drop(...TARGETS);
     this.maskOut = null;
     this.finalT = null;
     if (this.selTex) gl.deleteTexture(this.selTex);
@@ -326,11 +361,43 @@ export class Renderer {
     this.distT = null;
   }
 
+  /** 렌더 타깃을 지운다 (다음에 필요할 때 ensureTarget 이 다시 만든다) */
+  private drop(...keys: TargetKey[]) {
+    for (const k of keys) {
+      const t = this[k];
+      if (!t) continue;
+      deleteTarget(this.gl, t);
+      this[k] = null;
+    }
+  }
+
+  /** GPU 에는 지금 문서가 쓰는 마스크·전경·배경 이미지만 둔다.
+   *  실행 취소 기록에만 남은 누끼 결과는 CPU 사본(resources)에서 필요할 때 다시 올린다 (결과마다 6B/px 절약) */
   private gcTextures() {
     const gl = this.gl;
-    for (const [id, t] of this.maskTex) if (!resources.masks.has(id)) { gl.deleteTexture(t); this.maskTex.delete(id); }
-    for (const [id, t] of this.fgTex) if (!resources.fgs.has(id)) { gl.deleteTexture(t); this.fgTex.delete(id); }
-    for (const [id, t] of this.bgTex) if (!resources.bgImages.has(id)) { gl.deleteTexture(t.tex); this.bgTex.delete(id); }
+    const doc = this.doc;
+    const masks = new Set<string>();
+    if (doc?.cutout) masks.add(doc.cutout.maskId);
+    if (doc) for (const op of doc.strokes) if (op.kind === "raster") masks.add(op.id);
+    const fg = doc?.cutout?.fgId ?? null;
+    const bg = doc?.bg.mode === "image" ? doc.bg.imageId : null;
+    for (const [id, t] of this.maskTex) if (!masks.has(id) || !resources.masks.has(id)) { gl.deleteTexture(t); this.maskTex.delete(id); }
+    for (const [id, t] of this.fgTex) if (id !== fg || !resources.fgs.has(id)) { gl.deleteTexture(t); this.fgTex.delete(id); }
+    for (const [id, t] of this.bgTex) if (id !== bg || !resources.bgImages.has(id)) { gl.deleteTexture(t.tex); this.bgTex.delete(id); }
+  }
+
+  private scheduleScratchRelease() {
+    clearTimeout(this.idleTimer);
+    this.idleTimer = window.setTimeout(() => this.releaseScratch(), SCRATCH_IDLE_MS);
+  }
+
+  /** 계산용 중간 타깃을 내려놓는다. 결과(마스크·투명도·거리장·합성 등)는 그대로라 화면은 바뀌지 않는다 */
+  private releaseScratch() {
+    this.idleTimer = 0;
+    if (this.lost) return;
+    this.drop(...SCRATCH);
+    if (this.distT !== this.jfA) this.drop("jfA");
+    if (this.distT !== this.jfB) this.drop("jfB");
   }
 
   private getMask(id: string): WebGLTexture {
@@ -405,6 +472,8 @@ export class Renderer {
       this.applied = [];
       this.baseKey = null;
       this.maskOut = null;
+      this.drop("work");
+      this.d.matte = this.d.calpha = this.d.refine = true; // 누끼에서 나온 타깃들도 정리되게
       return;
     }
     const gl = this.gl;
@@ -455,9 +524,10 @@ export class Renderer {
   }
 
   /** 선택 영역(원본 크기 0..255) — 화면에 움직이는 점선으로 표시 */
-  setSelection(sel: { data: Uint8Array; w: number; h: number } | null, version: number) {
+  setSelection(sel: { data: Uint8Array; w: number; h: number; dirty?: { x: number; y: number; w: number; h: number } | null } | null, version: number) {
     if (version === this.selVersion) return;
     this.selVersion = version;
+    this.trimmed = false;
     const gl = this.gl;
     if (!sel) {
       if (this.selTex) gl.deleteTexture(this.selTex);
@@ -465,7 +535,17 @@ export class Renderer {
     } else if (this.selTex && this.selSize[0] === sel.w && this.selSize[1] === sel.h) {
       gl.bindTexture(gl.TEXTURE_2D, this.selTex);
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, sel.w, sel.h, gl.RED, gl.UNSIGNED_BYTE, sel.data);
+      const d = sel.dirty;
+      if (d && d.w > 0 && d.h > 0) {
+        // 선택 붓: 바뀐 부분만 올린다
+        gl.pixelStorei(gl.UNPACK_ROW_LENGTH, sel.w);
+        gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, d.x);
+        gl.pixelStorei(gl.UNPACK_SKIP_ROWS, d.y);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, d.x, d.y, d.w, d.h, gl.RED, gl.UNSIGNED_BYTE, sel.data);
+        gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+        gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, 0);
+        gl.pixelStorei(gl.UNPACK_SKIP_ROWS, 0);
+      } else gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, sel.w, sel.h, gl.RED, gl.UNSIGNED_BYTE, sel.data);
     } else {
       if (this.selTex) gl.deleteTexture(this.selTex);
       this.selTex = createTexture(gl, sel.w, sel.h, "r8", sel.data);
@@ -505,6 +585,7 @@ export class Renderer {
 
   /** 실시간 붓질 시작 — 획 객체의 pts 에 점을 추가하면서 extendStroke() 를 부른다 */
   beginStroke(s: Stroke) {
+    this.trimmed = false;
     if (this.d.mask) this.updateMask();
     this.live = { stroke: s, stamper: new Stamper(s) };
     this.extendStroke();
@@ -530,13 +611,43 @@ export class Renderer {
     const doc = this.doc!;
     if (!doc.cutout || !this.work) {
       this.maskOut = null;
+      this.drop("refined", "rA", "rB", "svA", "svB");
       return;
     }
+    this.refineBase(doc);
+    this.shave(Math.round(doc.edge.shave || 0));
+  }
+
+  /** 테두리 깎기: n 번 1px 씩 (결과는 svA) */
+  private shave(n: number) {
+    if (n <= 0 || !this.maskOut) {
+      this.drop("svA", "svB");
+      return;
+    }
+    const gl = this.gl;
+    const W = this.srcW, H = this.srcH;
+    this.svA = ensureTarget(gl, this.svA, W, H, "r8");
+    if (n > 1) this.svB = ensureTarget(gl, this.svB, W, H, "r8");
+    else this.drop("svB");
+    // 마지막이 svA 에 떨어지도록 시작 타깃을 고른다
+    let input = this.maskOut;
+    for (let i = 0; i < n; i++) {
+      const out = (n - i) % 2 === 1 ? this.svA : this.svB!;
+      bindTarget(gl, out);
+      this.p.erode.use().tex("uTex", 0, input).i("uDiag", i % 2);
+      this.drawQuad();
+      input = out.tex;
+    }
+    this.maskOut = this.svA.tex;
+  }
+
+  private refineBase(doc: Doc) {
     const e = doc.edge;
     const s = e.shift / 100;
     const k = e.contrast / 100;
     if (e.feather === 0 && s === 0 && k === 0 && !doc.invert) {
       this.maskOut = this.alphaTex();
+      this.drop("refined", "rA", "rB");
       return;
     }
     const gl = this.gl;
@@ -551,13 +662,15 @@ export class Renderer {
       this.rB = ensureTarget(gl, this.rB, lw, lh, "r8");
       if (f > 1) {
         bindTarget(gl, this.rA);
-        this.p.down.use().tex("uTex", 0, this.work.tex).f2("uSrcTexel", 1 / W, 1 / H).f("uFactor", f);
+        this.p.down.use().tex("uTex", 0, this.work!.tex).f2("uSrcTexel", 1 / W, 1 / H).f("uFactor", f);
         this.drawQuad();
         input = this.rA.tex;
       }
       this.blur(input, this.rB, sigma / f, 1 / lw, 0);
       this.blur(this.rB.tex, this.rA, sigma / f, 0, 1 / lh);
       input = this.rA.tex;
+    } else {
+      this.drop("rA", "rB");
     }
     const c = 0.5 - 0.45 * s;
     const w = Math.max(0.02, (1 - k) * (1 - 0.9 * Math.abs(s)));
@@ -572,7 +685,10 @@ export class Renderer {
     this.d.bgBlur = false;
     this.bgBlurValid = false;
     const doc = this.doc!;
-    if (!doc.cutout || doc.bg.mode !== "blur" || !this.maskOut || !this.src) return;
+    if (!doc.cutout || doc.bg.mode !== "blur" || !this.maskOut || !this.src) {
+      this.drop("bgA", "bgB");
+      return;
+    }
     const gl = this.gl;
     const W = this.srcW, H = this.srcH;
     const sigma = Math.max(1, (doc.bg.blur / 100) * Math.max(W, H) * 0.03);
@@ -595,7 +711,10 @@ export class Renderer {
     this.d.fringe = false;
     this.fringeValid = false;
     const doc = this.doc!;
-    if (!doc.cutout || !this.work || !this.src || doc.edge.defringe <= 0) return;
+    if (!doc.cutout || !this.work || !this.src || doc.edge.defringe <= 0) {
+      this.drop("frA", "frB");
+      return;
+    }
     const gl = this.gl;
     const W = this.srcW, H = this.srcH;
     const sigma = Math.max(0.6, doc.edge.defringe / 2);
@@ -618,11 +737,13 @@ export class Renderer {
     this.d.matte = false;
     this.matteValid = false;
     const doc = this.doc!;
-    if (!doc.cutout || !this.work || !this.src) return;
     const e = doc.edge;
-    const forMatte = e.deconMode === "matte" && e.matteSource === "auto" && doc.cutout.source !== "alpha";
+    const forMatte = !!doc.cutout && e.deconMode === "matte" && e.matteSource === "auto" && doc.cutout.source !== "alpha";
     const forAlpha = e.colorAlpha > 0 && !doc.invert;
-    if (!forMatte && !forAlpha) return;
+    if (!doc.cutout || !this.work || !this.src || (!forMatte && !forAlpha)) {
+      this.drop("mtA", "mtB");
+      return;
+    }
     const gl = this.gl;
     const W = this.srcW, H = this.srcH;
     // 경계 띠를 덮을 만큼: 긴 변의 0.8% (최소 6px)
@@ -641,21 +762,26 @@ export class Renderer {
     this.matteValid = true;
   }
 
-  /** 테두리용 거리장: 피사체 윤곽(마스크 0.5)까지의 거리를 Jump Flooding 으로 계산 */
+  /** 테두리용 거리장: 피사체 윤곽(마스크 0.5)까지의 거리를 Jump Flooding 으로 계산.
+   *  RG16UI 2장(픽셀당 8B)으로 계산하고, 끝나면 결과가 든 1장만 남는다 (잠시 뒤 releaseScratch) */
   private updateOutline() {
     this.d.outline = false;
     this.distT = null;
     const doc = this.doc!;
-    if (!doc.cutout || !doc.outline.enabled || !this.maskOut || !this.half) return;
+    if (!doc.cutout || !doc.outline.enabled || !this.maskOut) {
+      this.drop("jfA", "jfB");
+      return;
+    }
     const gl = this.gl;
     const W = this.srcW, H = this.srcH;
-    const f = W * H > 6e6 ? 2 : 1; // 아주 큰 사진은 절반 해상도 (오차 1px 이내)
+    const f = W * H > OUTLINE_HALF_RES ? 2 : 1; // 아주 큰 사진은 절반 해상도 (오차 1px 이내)
     const lw = Math.ceil(W / f), lh = Math.ceil(H / f);
-    this.jfA = ensureTarget(gl, this.jfA, lw, lh, "rgba32f");
-    this.jfB = ensureTarget(gl, this.jfB, lw, lh, "rgba32f");
+    this.jfA = ensureTarget(gl, this.jfA, lw, lh, "rg16ui");
+    this.jfB = ensureTarget(gl, this.jfB, lw, lh, "rg16ui");
+    this.distF = f;
     gl.disable(gl.BLEND);
     bindTarget(gl, this.jfA);
-    this.p.jfaInit.use().tex("uMask", 0, this.maskOut).f2("uSize", lw, lh).f("uF", f);
+    this.p.jfaInit.use().tex("uMask", 0, this.maskOut).f2("uSize", lw, lh);
     this.drawQuad();
     let read = this.jfA, write = this.jfB;
     const steps: number[] = [];
@@ -675,7 +801,10 @@ export class Renderer {
     this.d.calpha = false;
     this.calphaValid = false;
     const doc = this.doc!;
-    if (!doc.cutout || !this.work || !this.src || doc.edge.colorAlpha <= 0 || doc.invert) return;
+    if (!doc.cutout || !this.work || !this.src || doc.edge.colorAlpha <= 0 || doc.invert) {
+      this.drop("thA", "thB", "thC", "thD", "kA", "kB", "roiA", "roiB", "refA", "refB", "rnA", "rnB", "calpha");
+      return;
+    }
     const gl = this.gl;
     const W = this.srcW, H = this.srcH;
     const long = Math.max(W, H);
@@ -768,8 +897,8 @@ export class Renderer {
     this.rnB = ensureTarget(gl, this.rnB, Math.ceil(W / fn), Math.ceil(H / fn), fmt);
     prep(this.rnA, this.rnB, sn, fn);
 
-    // 5) 투명도 다시 계산
-    this.calpha = ensureTarget(gl, this.calpha, W, H, "rgba8");
+    // 5) 투명도 다시 계산 (r: 최종 투명도, g: 색 계산용 투명도 — 두 채널만 쓰므로 RG8)
+    this.calpha = ensureTarget(gl, this.calpha, W, H, "rg8");
     bindTarget(gl, this.calpha);
     this.p.calpha.use()
       .tex("uSrc", 0, this.src)
@@ -863,7 +992,10 @@ export class Renderer {
     this.d.shadow = false;
     this.shadowValid = false;
     const doc = this.doc!;
-    if (!doc.cutout || !doc.shadow.enabled || !this.maskOut) return;
+    if (!doc.cutout || !doc.shadow.enabled || !this.maskOut) {
+      this.drop("shA", "shB");
+      return;
+    }
     const gl = this.gl;
     const W = this.srcW, H = this.srcH;
     const sigma = 1 + (doc.shadow.blur / 100) * Math.max(W, H) * 0.035;
@@ -931,7 +1063,8 @@ export class Renderer {
     const [o2r, o2g, o2b] = ol.fill === "gradient" ? hexToRgb(ol.color2) : [o1r, o1g, o1b];
     const a1 = ol.alpha1 / 100, a2 = ol.fill === "gradient" ? ol.alpha2 / 100 : a1;
     this.p.comp
-      .tex("uDist", 12, this.distT ? this.distT.tex : this.clear)
+      .tex("uDist", 12, this.distT ? this.distT.tex : this.clearU)
+      .f("uDistF", this.distF)
       .f2("uSrcSize", this.srcW, this.srcH)
       .i("uOutlineOn", hasMask && ol.enabled && this.distT ? 1 : 0)
       .i("uOutlinePos", ol.position === "outside" ? 0 : ol.position === "center" ? 1 : 2)
@@ -948,7 +1081,14 @@ export class Renderer {
     const doc = this.doc!;
     const gl = this.gl;
     const [W, H] = outputSize(this.srcW, this.srcH, doc.orient);
+    const prevComp = this.comp;
     this.comp = ensureTarget(gl, this.comp, W, H, "rgba8", true);
+    if (this.comp !== prevComp) {
+      // 새로 만든 밉맵 텍스처는 밉맵을 한 번 만들어 둬야 '완전한' 텍스처가 된다. 안 그러면 효과 단계가
+      // 읽을 때 검게 나온다 (효과를 켠 채 90° 회전하거나 trim() 뒤 다시 계산할 때)
+      gl.bindTexture(gl.TEXTURE_2D, this.comp.tex);
+      gl.generateMipmap(gl.TEXTURE_2D);
+    }
     this.packParams(doc, this.params);
     this.runComposite(this.comp, doc, this.params, this.lut);
 
@@ -967,12 +1107,15 @@ export class Renderer {
         this.blur(this.clA.tex, this.clB, sigma / f, 1 / lw, 0);
         this.blur(this.clB.tex, this.clA, sigma / f, 0, 1 / lh);
         blurTex = this.clA.tex;
+      } else {
+        this.drop("clA", "clB");
       }
       this.fxT = ensureTarget(gl, this.fxT, W, H, "rgba8", true);
       this.runEffects(this.fxT, this.comp.tex, blurTex, doc, fx, W, H);
       this.finalT = this.fxT;
     } else {
       this.finalT = this.comp;
+      this.drop("fxT", "clA", "clB");
     }
     gl.bindTexture(gl.TEXTURE_2D, this.finalT.tex);
     gl.generateMipmap(gl.TEXTURE_2D);
@@ -1064,10 +1207,13 @@ export class Renderer {
     if (!t) return null;
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
-    let data: Float32Array | Uint8Array;
-    if (t.fmt === "rgba16f") {
+    let data: Float32Array | Uint8Array | Uint32Array;
+    if (t.fmt === "rgba16f" || t.fmt === "rgba32f") {
       data = new Float32Array(t.w * t.h * 4);
       gl.readPixels(0, 0, t.w, t.h, gl.RGBA, gl.FLOAT, data);
+    } else if (t.fmt === "rg16ui") {
+      data = new Uint32Array(t.w * t.h * 4);
+      gl.readPixels(0, 0, t.w, t.h, gl.RGBA_INTEGER, gl.UNSIGNED_INT, data);
     } else {
       data = new Uint8Array(t.w * t.h * 4);
       gl.readPixels(0, 0, t.w, t.h, gl.RGBA, gl.UNSIGNED_BYTE, data);
@@ -1087,27 +1233,33 @@ export class Renderer {
     if (!this.maskOut || !this.doc) return null;
     const gl = this.gl;
     const [W, H] = outputSize(this.srcW, this.srcH, this.doc.orient);
-    const t = ensureTarget(gl, null, W, H, "rgba8");
+    // 1채널(R8)로 그려서 띠 단위로 읽는다 — 큰 사진에서도 임시 메모리가 작게 (예전: RGBA8 전체 + 전체 판독)
+    const t = ensureTarget(gl, null, W, H, "r8");
     bindTarget(gl, t);
     this.p.orient.use().tex("uTex", 0, this.maskOut).m3("uOrient", orientMatrix(this.doc.orient));
     this.drawQuad();
-    const buf = new Uint8Array(region.w * region.h * 4);
+    const band = Math.max(1, Math.min(region.h, Math.floor((8 << 20) / (region.w * 4)))); // 띠 하나 ≤ 8MB
+    const buf = new Uint8Array(region.w * band * 4);
     gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
-    gl.readPixels(region.x, region.y, region.w, region.h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    deleteTarget(gl, t);
     let x0 = region.w, y0 = region.h, x1 = -1, y1 = -1;
-    for (let y = 0; y < region.h; y++) {
-      const row = y * region.w * 4;
-      for (let x = 0; x < region.w; x++) {
-        if (buf[row + x * 4] > 6) {
-          if (x < x0) x0 = x;
-          if (x > x1) x1 = x;
-          if (y < y0) y0 = y;
-          y1 = y;
+    for (let b0 = 0; b0 < region.h; b0 += band) {
+      const n = Math.min(band, region.h - b0);
+      gl.readPixels(region.x, region.y + b0, region.w, n, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      for (let r = 0; r < n; r++) {
+        const row = r * region.w * 4;
+        const y = b0 + r;
+        for (let x = 0; x < region.w; x++) {
+          if (buf[row + x * 4] > 6) {
+            if (x < x0) x0 = x;
+            if (x > x1) x1 = x;
+            if (y < y0) y0 = y;
+            y1 = y;
+          }
         }
       }
     }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    deleteTarget(gl, t);
     if (x1 < 0) return null;
     const ol = this.doc.outline;
     const pad = ol.enabled ? Math.ceil(ol.position === "outside" ? ol.width + ol.soft : ol.position === "center" ? ol.width / 2 + ol.soft : 0) : 0;
@@ -1194,8 +1346,69 @@ export class Renderer {
     return { params, lut: this.lutData.slice() };
   }
 
+  /** 메모리 정리 — 폴더 작업처럼 편집기를 한동안 쓰지 않을 때 부른다.
+   *  다시 계산할 수 있는 중간 결과와 누끼·배경 이미지 텍스처를 모두 내려놓고, 화면에는 마지막 결과를 그대로 둔다.
+   *  문서·화면·선택 영역이 바뀌거나 내보내기 등으로 결과가 필요해지면 그때 전부 다시 계산한다. */
+  trim() {
+    if (this.lost || !this.src || this.live) return;
+    const gl = this.gl;
+    const keep = this.finalT;
+    for (const k of TARGETS) if (this[k] !== keep) this.drop(k);
+    for (const t of this.maskTex.values()) gl.deleteTexture(t);
+    for (const t of this.fgTex.values()) gl.deleteTexture(t);
+    for (const t of this.bgTex.values()) gl.deleteTexture(t.tex);
+    this.maskTex.clear();
+    this.fgTex.clear();
+    this.bgTex.clear();
+    this.maskOut = null;
+    this.distT = null;
+    this.calphaValid = this.matteValid = this.fringeValid = this.bgBlurValid = this.shadowValid = false;
+    this.applied = [];
+    this.baseKey = null;
+    this.d = { mask: true, matte: true, calpha: true, refine: true, fringe: true, outline: true, bgBlur: true, shadow: true, comp: true };
+    clearTimeout(this.idleTimer);
+    this.idleTimer = 0;
+    this.trimmed = true;
+  }
+
+  /** GPU 메모리 사용량 추정 (MB) — 콘솔에서 __ms.getRenderer().memoryInfo() 로 확인 */
+  memoryInfo() {
+    const mb = (b: number) => Math.round((b / 1048576) * 10) / 10;
+    const targets: Record<string, number> = {};
+    let total = 0;
+    for (const k of TARGETS) {
+      const t = this[k];
+      if (!t) continue;
+      const b = t.w * t.h * FMT_BYTES[t.fmt] * (t.mips ? 4 / 3 : 1);
+      targets[k] = mb(b);
+      total += b;
+    }
+    let tex = this.src ? this.srcW * this.srcH * 4 * (4 / 3) : 0;
+    for (const id of this.maskTex.keys()) {
+      const m = resources.masks.get(id);
+      if (m) tex += m.w * m.h;
+    }
+    for (const id of this.fgTex.keys()) {
+      const f = resources.fgs.get(id);
+      if (f) tex += f.w * f.h * 4 * (4 / 3);
+    }
+    for (const b of this.bgTex.values()) tex += b.w * b.h * 4 * (4 / 3);
+    if (this.selTex) tex += this.selSize[0] * this.selSize[1];
+    return {
+      totalMB: mb(total + tex),
+      targetsMB: mb(total),
+      texturesMB: mb(tex),
+      targets,
+      maskTextures: this.maskTex.size,
+      fgTextures: this.fgTex.size,
+      bgTextures: this.bgTex.size,
+    };
+  }
+
   dispose() {
     cancelAnimationFrame(this.raf);
+    clearTimeout(this.idleTimer);
+    this.idleTimer = 0;
     this.resetImage();
   }
 }

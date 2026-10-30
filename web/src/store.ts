@@ -3,15 +3,18 @@ import { produce, setAutoFreeze, type Draft } from "immer";
 import {
   defaultDoc,
   outputSize,
+  type CutKind,
   type Doc,
+  type Inner,
   type Rect,
   type Target,
 } from "./types";
+import { isKind } from "./kinds";
 import { collectGarbage, resources } from "./resources";
 
 setAutoFreeze(false);
 
-export type Tool = "hand" | "zoom" | "marquee" | "lasso" | "wand" | "pen" | "brush" | "crop" | "eyedropper";
+export type Tool = "hand" | "zoom" | "marquee" | "lasso" | "wand" | "pen" | "brush" | "crop" | "eyedropper" | "bgpick" | "colorrange";
 export type SelMode = "new" | "add" | "sub" | "and";
 
 export interface PenPoint {
@@ -30,6 +33,8 @@ export interface WandSettings {
   tolerance: number; // 0..255
   contiguous: boolean;
   antialias: boolean;
+  /** 색 범위 도구(C)의 허용치 — 사진 전체에서 클릭한 색과 비슷한 곳 */
+  colorTol: number;
 }
 
 export interface Box {
@@ -93,6 +98,20 @@ export interface ImageInfo {
 }
 
 const MAX_HISTORY = 60;
+/** 기록에 남겨 두는 누끼 결과(마스크 + 전경색, 사진 한 장에 수십 MB) 수. 종류를 바꿔 가며 여러 번 따도
+ *  메모리가 계속 불어나지 않게, 그보다 오래된 기록은 버린다 (지금 화면의 결과는 항상 남음) */
+const MAX_CUTOUT_RESULTS = 3;
+
+function capCutoutResults(hist: HistEntry[]): HistEntry[] {
+  const seen = new Set<string>();
+  for (let i = hist.length - 1; i >= 0; i--) {
+    const fg = hist[i].doc.cutout?.fgId;
+    if (!fg || seen.has(fg)) continue;
+    seen.add(fg);
+    if (seen.size > MAX_CUTOUT_RESULTS) return hist.slice(i + 1);
+  }
+  return hist;
+}
 
 // ---------------------------------------------------------------------------
 // 환경설정 (localStorage)
@@ -102,28 +121,42 @@ interface Prefs {
   wand: WandSettings;
   marqueeShape: "rect" | "ellipse";
   lassoMode: "free" | "poly";
-  model: string;
-  precise: boolean;
+  kind: CutKind;
+  /** 잔티 제거: 떨어진 이 크기(px) 이하 점을 지움, 0 = 끔 */
+  despeckle: number;
   open: Record<string, boolean>;
 }
 
 const PREF_KEY = "mutoshop.prefs.v1";
 const defaultPrefs: Prefs = {
   brush: { mode: "add", size: 80, hardness: 60, opacity: 100, auto: false, tolerance: 30 },
-  wand: { tolerance: 32, contiguous: true, antialias: true },
+  wand: { tolerance: 32, contiguous: true, antialias: true, colorTol: 24 },
   marqueeShape: "rect",
   lassoMode: "free",
-  model: "general",
-  precise: true,
+  kind: "tree",
+  despeckle: 5,
   open: {},
 };
 
+/** 저장된 값은 필드를 골라서 읽는다. 통째로 펼치면 예전 버전이 저장한 'ultra(최고 품질) 켬' 같은
+ *  메모리를 많이 쓰는 값이 되살아난다 */
 function loadPrefs(): Prefs {
   try {
     const raw = localStorage.getItem(PREF_KEY);
     if (!raw) return defaultPrefs;
     const p = JSON.parse(raw);
-    return { ...defaultPrefs, ...p, brush: { ...defaultPrefs.brush, ...p.brush }, wand: { ...defaultPrefs.wand, ...p.wand } };
+    if (!p || typeof p !== "object") return defaultPrefs;
+    const d = defaultPrefs;
+    return {
+      brush: { ...d.brush, ...(p.brush && typeof p.brush === "object" ? p.brush : {}) },
+      wand: { ...d.wand, ...(p.wand && typeof p.wand === "object" ? p.wand : {}) },
+      marqueeShape: p.marqueeShape === "ellipse" ? "ellipse" : "rect",
+      lassoMode: p.lassoMode === "poly" ? "poly" : "free",
+      // 예전 버전은 종류 대신 AI 모델을 저장했다 (인물 모델 → 인물)
+      kind: isKind(p.kind) ? p.kind : p.model === "portrait" ? "person" : d.kind,
+      despeckle: Number.isFinite(p.despeckle) ? Math.max(0, Math.min(50, Math.round(p.despeckle))) : d.despeckle,
+      open: p.open && typeof p.open === "object" ? p.open : {},
+    };
   } catch {
     return defaultPrefs;
   }
@@ -136,7 +169,7 @@ function savePrefs(s: State) {
     try {
       const p: Prefs = {
         brush: s.brush, wand: s.wand, marqueeShape: s.marqueeShape, lassoMode: s.lassoMode,
-        model: s.model, precise: s.precise, open: s.sectionsOpen,
+        kind: s.kind, despeckle: s.despeckle, open: s.sectionsOpen,
       };
       localStorage.setItem(PREF_KEY, JSON.stringify(p));
     } catch {
@@ -155,6 +188,8 @@ export interface State {
   hist: HistEntry[];
   histIndex: number;
   savedIndex: number;
+  /** 마지막으로 저장(내보내기)한 파일 — 누끼 탭에 '저장됨'으로 보여 준다 */
+  lastSave: { name: string; at: number; info: string } | null;
 
   tool: Tool;
   prevTool: Tool;
@@ -164,7 +199,8 @@ export interface State {
   lassoMode: "free" | "poly";
   selMode: SelMode;
   /** 선택 영역 (픽셀은 selection.ts) — 바뀔 때마다 version 증가 */
-  sel: { version: number; box: Box | null };
+  /** 선택 영역: 버전 · 경계 상자 · 선택된 픽셀 수 · 넓히기/줄이기 누적(px, 새로 고르면 0) */
+  sel: { version: number; box: Box | null; area: number; grow: number };
   /** 스포이드로 고를 색: 배경색 / 원래 배경색(매트) */
   eyedropperTarget: "bg" | "matte";
   penPath: PenPath | null;
@@ -177,8 +213,14 @@ export interface State {
   viewport: { w: number; h: number; dpr: number };
   cropDraft: Rect | null;
   cropAspect: number | null; // null=자유, 0=원본 비율
-  model: string;
-  precise: boolean;
+  /** 누끼 종류 (나무·산·아이템·인물) — 사용자가 고르고, 저장된다 */
+  kind: CutKind;
+  /** 잔티 제거: 주요 객체와 떨어진 이 크기(px) 이하 점을 지움 (0 = 끔, 기본 5, 저장됨) */
+  despeckle: number;
+  /** 피사체 안쪽에 갇힌 배경색 처리 (저장 안 함, 종류를 바꾸면 '종류대로'로) */
+  inner: Inner;
+  /** 인물 사진의 머리카락 최고 품질 (느리고 메모리를 많이 씀 — 저장 안 함, 기본 끔) */
+  fine: boolean;
   job: JobState | null;
   server: ServerInfo | null;
   exportOpen: boolean;
@@ -196,11 +238,13 @@ export interface State {
   undo: () => void;
   redo: () => void;
   jumpTo: (i: number) => void;
-  markSaved: () => void;
+  markSaved: (save?: { name: string; info: string }) => void;
 
   // UI
   set: (p: Partial<State>) => void;
   setTool: (t: Tool) => void;
+  /** 종류만 바꾼다 (누끼를 다시 돌리지 않음) */
+  setKind: (k: CutKind) => void;
   setBrush: (p: Partial<BrushSettings>) => void;
   setWand: (p: Partial<WandSettings>) => void;
   setSectionOpen: (key: string, open: boolean) => void;
@@ -218,6 +262,7 @@ export const useStore = create<State>((set, get) => ({
   hist: [],
   histIndex: -1,
   savedIndex: 0,
+  lastSave: null,
 
   tool: "hand",
   prevTool: "hand",
@@ -226,7 +271,7 @@ export const useStore = create<State>((set, get) => ({
   marqueeShape: prefs.marqueeShape,
   lassoMode: prefs.lassoMode,
   selMode: "new",
-  sel: { version: 0, box: null },
+  sel: { version: 0, box: null, area: 0, grow: 0 },
   eyedropperTarget: "bg",
   penPath: null,
   panel: "cutout",
@@ -238,8 +283,10 @@ export const useStore = create<State>((set, get) => ({
   viewport: { w: 800, h: 600, dpr: 1 },
   cropDraft: null,
   cropAspect: null,
-  model: prefs.model,
-  precise: prefs.precise,
+  kind: prefs.kind,
+  despeckle: prefs.despeckle,
+  inner: "auto",
+  fine: false,
   job: null,
   server: null,
   exportOpen: false,
@@ -256,6 +303,7 @@ export const useStore = create<State>((set, get) => ({
       hist: [{ label, doc, time: performance.now() }],
       histIndex: 0,
       savedIndex: 0,
+      lastSave: null,
       tool: "hand",
       target: "global",
       viewMode: "normal",
@@ -290,6 +338,7 @@ export const useStore = create<State>((set, get) => ({
     let hist = s.hist.slice(0, s.histIndex + 1);
     hist.push({ label, doc: s.doc, time: now });
     if (hist.length > MAX_HISTORY) hist = hist.slice(hist.length - MAX_HISTORY);
+    hist = capCutoutResults(hist);
     const dropped = s.histIndex + 1 - (hist.length - 1);
     set({ hist, histIndex: hist.length - 1, savedIndex: s.savedIndex - Math.max(0, dropped) });
     gc();
@@ -321,7 +370,10 @@ export const useStore = create<State>((set, get) => ({
     set({ histIndex: i, doc: s.hist[i].doc });
   },
 
-  markSaved: () => set((s) => ({ savedIndex: s.histIndex })),
+  markSaved: (save) => set((s) => ({
+    savedIndex: s.histIndex,
+    lastSave: save ? { ...save, at: Date.now() } : s.lastSave,
+  })),
 
   set: (p) => set(p),
 
@@ -339,6 +391,11 @@ export const useStore = create<State>((set, get) => ({
       return;
     }
     set({ tool: t, prevTool: s.tool, ...(s.tool === "eyedropper" ? { eyedropperTarget: "bg" as const } : {}) });
+  },
+
+  setKind: (k) => {
+    if (k === get().kind) return;
+    set({ kind: k, inner: "auto" });
   },
 
   setBrush: (p) => {
@@ -384,9 +441,9 @@ export const useStore = create<State>((set, get) => ({
   },
 }));
 
-// 모델·정밀모드 변경도 저장
+// 누끼 종류·선택 도구 모양 변경도 저장
 useStore.subscribe((s, p) => {
-  if (s.model !== p.model || s.precise !== p.precise || s.marqueeShape !== p.marqueeShape || s.lassoMode !== p.lassoMode) savePrefs(s);
+  if (s.kind !== p.kind || s.despeckle !== p.despeckle || s.marqueeShape !== p.marqueeShape || s.lassoMode !== p.lassoMode) savePrefs(s);
 });
 
 /** 화면에 보이는 영역의 크기(출력 px). 자르기 도구 중에는 전체, 아니면 자른 영역. */
@@ -411,6 +468,7 @@ function gc() {
   const add = (d: Doc) => {
     if (d.cutout) {
       ref.add(d.cutout.maskId);
+      if (d.cutout.rawMaskId) ref.add(d.cutout.rawMaskId);
       if (d.cutout.fgId) ref.add(d.cutout.fgId);
     }
     if (d.bg.imageId) ref.add(d.bg.imageId);

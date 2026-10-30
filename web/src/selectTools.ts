@@ -5,7 +5,8 @@ import { create } from "zustand";
 import { screenToSource, sourceToScreen } from "./actions";
 import { resources } from "./resources";
 import {
-  applySelection, clearSelection, combineSelection, penRegion, polygonRegion, rectRegion, wandRegion,
+  applySelection, beginSelBrush, clearSelection, combineSelection, endSelBrush, moveSelBrush, penRegion, polygonRegion, rectRegion,
+  wandClick, withoutSelHistory,
   type SelApply,
 } from "./selection";
 import { useStore, type PenPath, type PenPoint, type SelMode } from "./store";
@@ -25,6 +26,12 @@ type PenDrag =
 
 let penDrag: PenDrag | null = null;
 
+/** 마술봉·색 범위: 누른 채 움직이지 않고 떼면 클릭(색 고르기), 끌면 선택 붓 */
+let wandDown: {
+  x: number; y: number; sx: number; sy: number; mode: SelMode; color: boolean; add: boolean;
+  brush: "no" | "on" | "skip";
+} | null = null;
+
 interface Ev {
   shiftKey: boolean;
   altKey: boolean;
@@ -36,7 +43,7 @@ export function modeFromEvent(e: Ev): SelMode {
   if (e.shiftKey && e.altKey) return "and";
   if (e.shiftKey) return "add";
   if (e.altKey) return "sub";
-  return useStore.getState().selMode;
+  return "new";
 }
 
 const draft = () => useDraft.getState().d;
@@ -86,13 +93,13 @@ export function toolDown(e: Ev, sx: number, sy: number): boolean {
       return false;
     }
 
-    case "wand": {
-      const t0 = performance.now();
-      const r = wandRegion(src, x, y, s.wand.tolerance, s.wand.contiguous, s.wand.antialias);
-      combineSelection(r, modeFromEvent(e));
-      if (performance.now() - t0 > 400) s.toast("넓은 영역을 선택했어요.", "info", 1500);
-      return false;
-    }
+    case "colorrange":
+    case "wand":
+      wandDown = {
+        x, y, sx, sy, mode: modeFromEvent(e), color: s.tool === "colorrange",
+        add: e.shiftKey && !e.altKey, brush: "no",
+      };
+      return true;
 
     case "pen":
       return penDown(e, x, y);
@@ -105,6 +112,14 @@ export function toolMove(e: Ev, sx: number, sy: number, dragging: boolean) {
   const p = screenToSource(sx, sy);
   if (!p) return;
   const [x, y] = p;
+  const w = wandDown;
+  if (w && dragging && (s.tool === "wand" || s.tool === "colorrange")) {
+    if (w.brush === "no" && Math.hypot(sx - w.sx, sy - w.sy) >= 4) {
+      w.brush = beginSelBrush(w.x, w.y, w.add, s.brush.size) ? "on" : "skip";
+    }
+    if (w.brush === "on") moveSelBrush(x, y);
+    return;
+  }
   const d = draft();
   if (s.tool === "marquee" && d?.kind === "rect" && dragging) {
     let x1 = x, y1 = y;
@@ -127,6 +142,17 @@ export function toolMove(e: Ev, sx: number, sy: number, dragging: boolean) {
 
 export function toolUp() {
   const s = useStore.getState();
+  const w = wandDown;
+  if (w) {
+    wandDown = null;
+    if (w.brush === "on") endSelBrush();
+    else if (w.brush === "no" && resources.source) {
+      const t0 = performance.now();
+      wandClick(resources.source, w.x, w.y, w.mode, w.color ? "color" : "wand");
+      if (performance.now() - t0 > 400) s.toast("넓은 영역을 선택했어요.", "info", 1500);
+    }
+    return;
+  }
   const d = draft();
   if (s.tool === "marquee" && d?.kind === "rect") {
     setDraft(null);
@@ -208,6 +234,8 @@ export function toolKey(e: KeyboardEvent): boolean {
 export function cancelDrafts() {
   setDraft(null);
   penDrag = null;
+  if (wandDown?.brush === "on") endSelBrush();
+  wandDown = null;
 }
 
 function finishPoly() {
@@ -319,8 +347,11 @@ export function penToSelection(mode: SelMode = "new"): boolean {
 
 /** 펜 경로로 바로 지우기/남기기 */
 export function penApply(kind: SelApply) {
-  if (penToSelection("new")) {
-    applySelection(kind);
-    clearSelection();
-  }
+  // 펜 경로 → 선택 → 지우기 는 편집 한 단계로만 (Ctrl+Z 한 번에 되돌아가게)
+  withoutSelHistory(() => {
+    if (penToSelection("new")) {
+      applySelection(kind);
+      clearSelection();
+    }
+  });
 }

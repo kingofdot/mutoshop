@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Droplet, Image as ImageIcon, ImagePlus, Pipette, Sparkles } from "lucide-react";
 import { chooseBackgroundImage, runCutout } from "../../actions";
+import { KIND } from "../../kinds";
 import { resources } from "../../resources";
 import { useStore } from "../../store";
 import type { BgMode } from "../../types";
@@ -41,6 +42,7 @@ function bgThumb(id: string | null): string | null {
 
 export function BackgroundPanel() {
   const image = useStore((s) => s.image);
+  const kind = useStore((s) => s.kind);
   const hasMask = useStore((s) => !!s.doc.cutout);
   const bg = useStore((s) => s.doc.bg);
   const sh = useStore((s) => s.doc.shadow);
@@ -60,7 +62,7 @@ export function BackgroundPanel() {
       <div className="empty-note">
         배경을 바꾸려면 먼저 피사체를 분리해야 해요.
         <button className="btn magic mt12" disabled={!!job} onClick={() => { set({ panel: "cutout" }); runCutout(); }}>
-          <Sparkles size={17} /> 자동 누끼 따기
+          <Sparkles size={17} /> {KIND[kind].label} 누끼 따기
         </button>
       </div>
     );
@@ -177,115 +179,6 @@ export function BackgroundPanel() {
           </div>
         )}
       </Section>
-
-      <OutlineSection />
     </>
   );
 }
-
-const GRADIENT_PRESETS: { label: string; c1: string; a1: number; c2: string; a2: number }[] = [
-  { label: "검정 → 투명", c1: "#000000", a1: 100, c2: "#000000", a2: 0 },
-  { label: "검정 → 흰색", c1: "#000000", a1: 100, c2: "#ffffff", a2: 100 },
-  { label: "흰색 → 투명", c1: "#ffffff", a1: 100, c2: "#ffffff", a2: 0 },
-  { label: "흰색 → 검정", c1: "#ffffff", a1: 100, c2: "#000000", a2: 100 },
-];
-
-function rgba(hex: string, alpha: number) {
-  const n = parseInt(hex.slice(1), 16);
-  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha / 100})`;
-}
-
-/** 테두리(외곽선): 포토샵 레이어 스타일의 '획'. 그라디언트는 윤곽을 따라 바깥 → 안쪽으로 */
-function OutlineSection() {
-  const ol = useStore((s) => s.doc.outline);
-  const image = useStore((s) => s.image);
-  const setDoc = useStore((s) => s.setDoc);
-  const commit = useStore((s) => s.commit);
-  const change = useStore((s) => s.change);
-  const long = image ? Math.max(image.w, image.h) : 2000;
-  const maxW = Math.max(60, Math.round(long / 8));
-  const grad = ol.fill === "gradient";
-
-  const enable = (v: boolean) =>
-    change(v ? "테두리 켜기" : "테두리 끄기", (d) => {
-      d.outline.enabled = v;
-      // 처음 켤 때 사진 크기에 맞는 두께로
-      if (v && d.outline.width === 16) d.outline.width = Math.round(Math.min(60, Math.max(4, long * 0.006)));
-    });
-
-  return (
-    <Section id="bg.outline" title="테두리" modified={ol.enabled}>
-      <Toggle
-        on={ol.enabled}
-        onChange={enable}
-        label="테두리 넣기"
-        desc="피사체 둘레에 외곽선을 입혀요. 그라디언트로 하면 가장 바깥에서 안쪽으로 색이 바뀝니다."
-      />
-      {ol.enabled && (
-        <div className="mt12">
-          <div className="field-label">위치</div>
-          <Segmented
-            value={ol.position}
-            onChange={(v) => change("테두리 위치", (d) => { d.outline.position = v; })}
-            options={[
-              { value: "outside", label: "바깥", tip: "피사체 바깥으로" },
-              { value: "center", label: "가운데", tip: "윤곽선 기준 양쪽으로" },
-              { value: "inside", label: "안쪽", tip: "피사체 안쪽으로 (크기 변화 없음)" },
-            ]}
-          />
-          <div className="mt8">
-            <Slider label="두께" value={ol.width} min={1} max={maxW} def={Math.round(Math.min(60, Math.max(4, long * 0.006)))}
-              format={(v) => `${v}px`} onChange={(v) => setDoc((d) => { d.outline.width = v; })} onCommit={() => commit("테두리 두께")} />
-            <Slider label="부드럽게" value={ol.soft} min={0} max={30} step={0.5} def={0} format={(v) => `${v}px`}
-              tip="테두리 가장자리를 흐리게" onChange={(v) => setDoc((d) => { d.outline.soft = v; })} onCommit={() => commit("테두리 부드럽게")} />
-            <Slider label="불투명도" value={ol.opacity} min={0} max={100} def={100} format={(v) => `${v}%`}
-              onChange={(v) => setDoc((d) => { d.outline.opacity = v; })} onCommit={() => commit("테두리 불투명도")} />
-          </div>
-
-          <div className="field-label mt8">채우기</div>
-          <Segmented
-            value={ol.fill}
-            onChange={(v) => change("테두리 채우기", (d) => { d.outline.fill = v; })}
-            options={[{ value: "solid", label: "단색" }, { value: "gradient", label: "그라디언트" }]}
-          />
-
-          {grad && (
-            <>
-              <div className="outline-preview checker mt8">
-                <div style={{ background: `linear-gradient(90deg, ${rgba(ol.color, ol.alpha1)}, ${rgba(ol.color2, ol.alpha2)})` }} />
-              </div>
-              <div className="row small muted" style={{ justifyContent: "space-between", marginTop: 3 }}>
-                <span>가장 바깥</span>
-                <span>안쪽</span>
-              </div>
-              <div className="chip-row mt8" style={{ flexWrap: "wrap" }}>
-                {GRADIENT_PRESETS.map((p) => (
-                  <button key={p.label} className="chip" onClick={() => change(`테두리: ${p.label}`, (d) => {
-                    Object.assign(d.outline, { color: p.c1, alpha1: p.a1, color2: p.c2, alpha2: p.a2, fill: "gradient" });
-                  })}>{p.label}</button>
-                ))}
-              </div>
-            </>
-          )}
-
-          <div className="field-label mt12">{grad ? "가장 바깥 색" : "색"}</div>
-          <ColorField value={ol.color} onChange={(v) => setDoc((d) => { d.outline.color = v; })} onCommit={() => commit("테두리 색")} />
-          {grad && (
-            <>
-              <Slider label="바깥 불투명도" value={ol.alpha1} min={0} max={100} def={100} format={(v) => `${v}%`}
-                onChange={(v) => setDoc((d) => { d.outline.alpha1 = v; })} onCommit={() => commit("테두리 바깥 불투명도")} />
-              <div className="field-label mt8">가장 안쪽 색</div>
-              <ColorField value={ol.color2} onChange={(v) => setDoc((d) => { d.outline.color2 = v; })} onCommit={() => commit("테두리 안쪽 색")} />
-              <Slider label="안쪽 불투명도" value={ol.alpha2} min={0} max={100} def={0} format={(v) => `${v}%`}
-                onChange={(v) => setDoc((d) => { d.outline.alpha2 = v; })} onCommit={() => commit("테두리 안쪽 불투명도")} />
-            </>
-          )}
-          {ol.position === "outside" && ol.width > long / 40 && (
-            <div className="hint mt8">가는 가지·털이 많은 피사체는 바깥 테두리가 두꺼우면 틈이 메워져요. 그럴 땐 두께를 줄이거나 ‘안쪽’을 써 보세요.</div>
-          )}
-        </div>
-      )}
-    </Section>
-  );
-}
-

@@ -1,6 +1,8 @@
 import { useCallback, useEffect } from "react";
-import { applyCrop, cancelCrop, copyToClipboard, openFromPicker, openImage, refreshServer } from "./actions";
+import { applyCrop, cancelCrop, closeImage, copyToClipboard, openDropped, openFromPicker, openImage, refreshServer } from "./actions";
+import { BatchDialog } from "./components/BatchDialog";
 import { ExportDialog } from "./components/ExportDialog";
+import { useBatch } from "./batch";
 import { OptionsBar } from "./components/OptionsBar";
 import { ConfirmDialog, DragOverlay, ShortcutsDialog, Toasts } from "./components/Overlays";
 import { SidePanel } from "./components/SidePanel";
@@ -9,25 +11,36 @@ import { Toolbar } from "./components/Toolbar";
 import { TopBar, cycleView } from "./components/TopBar";
 import { Viewport, useKeys } from "./components/Viewport";
 import { toolKey } from "./selectTools";
-import { applySelection, clearSelection, invertSelection, selectAll } from "./selection";
+import { applySelection, clearSelection, growSelection, invertSelection, redoStep, selectAll, undoStep } from "./selection";
+import { Filmstrip } from "./components/Filmstrip";
+import { openFolderWork, saveCurrent, stepFolder, useFolder } from "./folder";
 import { hasUnsaved, useStore } from "./store";
 
+const NOT_TEXT = new Set(["range", "checkbox", "radio", "button", "color", "submit", "reset"]);
+
+/** 글자를 입력하는 칸인지 (슬라이더·체크 상자는 아님 — 끈 뒤에도 단축키가 되게) */
 function isTyping(e: KeyboardEvent) {
   const t = e.target as HTMLElement | null;
   if (!t) return false;
   const tag = t.tagName;
-  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || t.isContentEditable;
+  if (tag === "INPUT") return !NOT_TEXT.has((t as HTMLInputElement).type);
+  return tag === "TEXTAREA" || tag === "SELECT" || t.isContentEditable;
 }
+
+const isGrowKey = (e: KeyboardEvent) =>
+  e.altKey && !e.ctrlKey && !e.metaKey && (e.key === "-" || e.key === "=" || e.key === "+" || e.code === "Minus" || e.code === "Equal");
 
 function useShortcuts() {
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
-      if (isTyping(e)) return;
+      // 숫자 칸에 커서가 있어도 Alt+-/= (선택 넓히기·줄이기)는 된다
+      if (isTyping(e) && !(isGrowKey(e) && useStore.getState().sel.box)) return;
       const s = useStore.getState();
       if (s.exportOpen || s.shortcutsOpen) {
         if (e.key === "Escape") s.set({ exportOpen: false, shortcutsOpen: false });
         return;
       }
+      if (useBatch.getState().open) return; // 폴더 작업 창이 열려 있으면 편집기 단축키는 쉰다
       const mod = e.ctrlKey || e.metaKey;
       const k = e.key.toLowerCase();
       const img = !!s.image;
@@ -44,10 +57,15 @@ function useShortcuts() {
         if (img && k === "d") { handled(); clearSelection(); return; }
         if (img && k === "i" && e.shiftKey) { handled(); invertSelection(); return; }
         if (img && k === "j") { handled(); applySelection("keep"); return; }
-        if (k === "z") { handled(); e.shiftKey ? s.redo() : s.undo(); return; }
-        if (k === "y") { handled(); s.redo(); return; }
+        // 실행 취소: 선택도 한 단계씩 (편집과 섞이면 더 최근 것부터)
+        if (k === "z") { handled(); e.shiftKey ? redoStep() : undoStep(); return; }
+        if (k === "y") { handled(); redoStep(); return; }
         if (k === "o") { handled(); openFromPicker(); return; }
-        if (k === "s" && img) { handled(); s.set({ exportOpen: true }); return; }
+        // 프로그램 창(WebView2)에서는 Ctrl+W 가 창을 닫지 않으므로 '사진 닫기'로 쓴다
+        if (k === "w" && !e.shiftKey) { handled(); closeImage(); return; }
+        if (k === "o" && e.shiftKey) { handled(); openFolderWork(); return; }
+        // 필름 줄에서 연 사진이면 누끼 폴더에 바로, 아니면 내보내기 창
+        if (k === "s" && img) { handled(); saveCurrent(); return; }
         if (k === "c" && e.shiftKey && img) { handled(); copyToClipboard(); return; }
         if (k === "0" && img) { handled(); s.fitView(); return; }
         if (k === "1" && img) { handled(); s.zoomAt(1); return; }
@@ -77,7 +95,18 @@ function useShortcuts() {
         if (e.key === "Escape") { handled(); cancelCrop(); return; }
       }
       if (!img) return;
-      if (e.key === "Escape" && s.tool === "eyedropper") { s.setTool("hand"); return; }
+      if (e.key === "Escape" && (s.tool === "eyedropper" || s.tool === "bgpick")) { s.setTool("hand"); return; }
+      if (s.sel.box && isGrowKey(e)) {
+        handled();
+        const minus = e.key === "-" || e.code === "Minus";
+        growSelection((minus ? -1 : 1) * (e.shiftKey ? 5 : 1));
+        return;
+      }
+      if ((e.key === "PageDown" || e.key === "PageUp") && useFolder.getState().token) {
+        handled();
+        stepFolder(e.key === "PageDown" ? 1 : -1);
+        return;
+      }
       if ((e.key === "Delete" || e.key === "Backspace") && s.sel.box) {
         handled();
         applySelection("delete");
@@ -94,14 +123,16 @@ function useShortcuts() {
           s.setTool("lasso");
           break;
         case "w": s.setTool("wand"); break;
+        case "g": s.setTool("bgpick"); break;
         case "p": s.setTool("pen"); break;
         case "z": s.setTool("zoom"); break;
         case "b": s.setBrush({ mode: "add" }); s.setTool("brush"); break;
         case "e": s.setBrush({ mode: "sub" }); s.setTool("brush"); break;
         case "x": s.setBrush({ mode: s.brush.mode === "add" ? "sub" : "add" }); break;
-        case "c": s.setTool("crop"); break;
+        case "c": s.setTool(e.shiftKey ? "crop" : "colorrange"); break; // C: 색 범위 · Shift+C: 자르기
         case "i": s.setTool("eyedropper"); break;
-        case "f": cycleView(); break;
+        case "f": cycleView(1); break;
+        case "a": cycleView(-1); break;
         case "[":
         case "{":
           if (e.shiftKey) s.setBrush({ hardness: Math.max(0, s.brush.hardness - 10) });
@@ -177,17 +208,20 @@ export default function App() {
     return () => window.removeEventListener("beforeunload", onBefore);
   }, []);
 
-  const onDropFile = useCallback((f: File) => openImage(f, f.name), []);
+  const onDropFile = useCallback((f: File, h?: Promise<unknown> | null) => openDropped(f, h), []);
+  const film = useFolder((s) => !!s.token);
 
   return (
-    <div className="app">
+    <div className={`app${film ? " film" : ""}`}>
       <TopBar />
+      <Filmstrip />
       <OptionsBar />
       <Toolbar />
       <Viewport />
       <SidePanel />
       <StatusBar />
       <ExportDialog />
+      <BatchDialog />
       <ConfirmDialog />
       <ShortcutsDialog />
       <DragOverlay onFile={onDropFile} />

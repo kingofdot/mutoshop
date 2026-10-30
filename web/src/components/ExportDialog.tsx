@@ -1,3 +1,5 @@
+import { overwriteCurrent } from "../folder";
+import { useOrigin } from "../origin";
 import { useEffect, useMemo, useState } from "react";
 import { Clipboard, Download, X } from "lucide-react";
 import {
@@ -25,6 +27,7 @@ function ExportInner() {
   const bgMode = useStore((s) => s.doc.bg.mode);
   const hasMask = useStore((s) => !!s.doc.cutout);
   const markSaved = useStore((s) => s.markSaved);
+  const origin = useOrigin((s) => s.origin);
   const toast = useStore((s) => s.toast);
   const transparent = hasMask && bgMode === "transparent";
   const layoutOk = hasMask && (bgMode === "transparent" || bgMode === "color");
@@ -82,10 +85,11 @@ function ExportInner() {
     setSaving(true);
     try {
       const blob = await renderExport(opts);
-      const ok = await saveBlob(blob, `${name || "image"}${EXT[format]}`, format);
-      if (ok) {
-        markSaved();
-        toast(`저장했어요 · ${size?.[0]}×${size?.[1]} ${format.toUpperCase()} · ${(blob.size / 1024 / 1024).toFixed(1)}MB`, "success", 4000);
+      const saved = await saveBlob(blob, `${name || "image"}${EXT[format]}`, format);
+      if (saved) {
+        const info = `${size?.[0]}×${size?.[1]} ${format.toUpperCase()} · ${(blob.size / 1024 / 1024).toFixed(1)}MB`;
+        markSaved({ name: saved, info });
+        toast(`저장했어요 · ${saved} · ${info}`, "success", 4000);
         close();
       }
     } catch (e) {
@@ -175,6 +179,13 @@ function ExportInner() {
           </button>
           <div className="spacer" />
           <button className="btn" onClick={close}>취소</button>
+          {origin && (
+            <button className="btn danger-ghost" disabled={saving}
+              onClick={async () => { if (await overwriteCurrent()) close(); }}
+              data-tip={`원본 파일(${origin.name})에 그대로 덮어쓰기 · 같은 이름·형식`}>
+              원본에 덮어쓰기
+            </button>
+          )}
           <button className="btn primary" onClick={save} disabled={saving}>
             <Download size={15} /> {saving ? "저장 중…" : "저장"}
           </button>

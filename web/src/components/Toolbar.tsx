@@ -1,4 +1,6 @@
-import { Brush, CircleDashed, Crop, Eraser, Hand, Lasso, LassoSelect, PenTool, Pipette, SquareDashed, Wand, ZoomIn } from "lucide-react";
+import {
+  Brush, CircleDashed, Crop, Droplets, Eraser, Hand, Lasso, LassoSelect, MousePointerClick, PenTool, Pipette, SquareDashed, Wand, ZoomIn,
+} from "lucide-react";
 import type { ReactNode } from "react";
 import { useStore, type Tool } from "../store";
 
@@ -53,7 +55,12 @@ export function Toolbar() {
         {lassoMode === "free" ? <Lasso size={19} /> : <LassoSelect size={19} />}
       </ToolBtn>
       <ToolBtn active={tool === "wand"} tip="자동 선택 · 마술봉 (W)" onClick={() => setTool("wand")} disabled={off}><Wand size={19} /></ToolBtn>
+      <ToolBtn active={tool === "colorrange"} tip="색 범위 — 클릭한 색과 비슷한 곳을 사진 전체에서 선택 → Delete 로 지우기 (C)"
+        onClick={() => setTool("colorrange")} disabled={off}><Droplets size={19} /></ToolBtn>
       <ToolBtn active={tool === "pen"} tip="펜 도구 (P)" onClick={() => setTool("pen")} disabled={off}><PenTool size={19} /></ToolBtn>
+      <ToolBtn active={tool === "bgpick"} tip="배경 찍기 — 클릭한 배경만 지우기 (G)" onClick={() => setTool("bgpick")} disabled={off}>
+        <MousePointerClick size={19} />
+      </ToolBtn>
       <div className="tool-sep" />
       <ToolBtn active={tool === "brush" && mode === "add"} tip="복원 브러시 (B)" onClick={() => brush("add")} disabled={off}>
         <Brush size={19} />
@@ -64,7 +71,7 @@ export function Toolbar() {
         <span className="badge">−</span>
       </ToolBtn>
       <div className="tool-sep" />
-      <ToolBtn active={tool === "crop"} tip="자르기 · 회전 (C)" onClick={() => setTool("crop")} disabled={off}><Crop size={19} /></ToolBtn>
+      <ToolBtn active={tool === "crop"} tip="자르기 · 회전 (Shift+C)" onClick={() => setTool("crop")} disabled={off}><Crop size={19} /></ToolBtn>
       <ToolBtn active={tool === "eyedropper"} tip="스포이드 — 배경색 고르기 (I)" onClick={() => setTool("eyedropper")} disabled={off}><Pipette size={19} /></ToolBtn>
     </div>
   );

@@ -142,3 +142,20 @@ export function ColorField({
     </div>
   );
 }
+
+/** 접어 두는 '더보기' 묶음. 접혀 있어도 지금 값을 요약해 보여 주고, 열림 상태는 기억된다
+ *  (자주 안 쓰는 설정을 숨겨 화면을 단순하게) */
+export function More({ id, summary, children }: { id: string; summary?: ReactNode; children: ReactNode }) {
+  const open = useStore((s) => s.sectionsOpen[id] ?? false);
+  const setOpen = useStore((s) => s.setSectionOpen);
+  return (
+    <div className="more">
+      <button className="more-head" onClick={() => setOpen(id, !open)} aria-expanded={open}>
+        <ChevronRight size={13} className={`chev${open ? " open" : ""}`} />
+        <span className="more-label">더보기</span>
+        {summary && <span className="more-sum">· {summary}</span>}
+      </button>
+      {open && <div className="more-body">{children}</div>}
+    </div>
+  );
+}

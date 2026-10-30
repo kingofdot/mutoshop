@@ -374,49 +374,67 @@ void main() {
   o = vec4(v);
 }`;
 
+/** 테두리 깎기 한 번 (1px): 이웃 중 가장 투명한 값으로. 십자(상하좌우)와 3×3 사각형을 번갈아 쓰면
+ *  여러 번 깎아도 모서리·대각선이 고르게(팔각형) 깎인다. 사진 가장자리 밖은 가장자리 값으로 본다 (잘린 피사체는 안 깎임) */
+export const FS_ERODE = HEAD + /* glsl */ `
+uniform sampler2D uTex;
+uniform int uDiag;
+out vec4 o;
+float at(ivec2 p, ivec2 hi) { return texelFetch(uTex, clamp(p, ivec2(0), hi), 0).r; }
+void main() {
+  ivec2 hi = textureSize(uTex, 0) - 1;
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  float v = at(p, hi);
+  v = min(v, min(min(at(p + ivec2(1, 0), hi), at(p - ivec2(1, 0), hi)), min(at(p + ivec2(0, 1), hi), at(p - ivec2(0, 1), hi))));
+  if (uDiag == 1) {
+    v = min(v, min(min(at(p + ivec2(1, 1), hi), at(p - ivec2(1, 1), hi)), min(at(p + ivec2(1, -1), hi), at(p - ivec2(1, -1), hi))));
+  }
+  o = vec4(v);
+}`;
+
 /** 테두리용 거리장 (Jump Flooding).
- *  각 픽셀에 '가장 가까운 피사체 픽셀'(rg)과 '가장 가까운 배경 픽셀'(ba)의 좌표(원본 px)를 저장한다. */
+ *  픽셀마다 '가장 가까운 피사체 픽셀'과 '가장 가까운 배경 픽셀'이 필요한데, 둘 중 하나는 늘 자기 자신이다
+ *  (피사체 픽셀의 가장 가까운 피사체 픽셀 = 자신). 그래서 RG16UI 한 장에 '반대편'의 가장 가까운 픽셀만 저장한다.
+ *    x: 비트 15 = 이 픽셀이 피사체(마스크 ≥ 0.5)인지, 비트 0~14 = 반대편 픽셀의 열 (거리장 해상도 기준)
+ *    y: 반대편 픽셀의 행, 아직 모르면 0xFFFF
+ *  좌표는 거리장 픽셀 번호, 원본 px 로는 (번호 + 0.5) × uF. 예전 rgba32f(자기 + 반대편 좌표 4개)와 계산 결과가 같다. */
 export const FS_JFA_INIT = HEAD + /* glsl */ `
 uniform sampler2D uMask;
 uniform vec2 uSize;
-uniform float uF;
-out vec4 o;
+out uvec2 o;
 void main() {
   vec2 p = floor(gl_FragCoord.xy);
   float m = textureLod(uMask, (p + 0.5) / uSize, 0.0).r;
-  vec2 pc = (p + 0.5) * uF;
-  o = vec4(m >= 0.5 ? pc : vec2(-1.0), m < 0.5 ? pc : vec2(-1.0));
+  o = uvec2(m >= 0.5 ? 0x8000u : 0u, 0xFFFFu);
 }`;
 
 export const FS_JFA_STEP = HEAD + /* glsl */ `
-uniform sampler2D uTex;
+uniform highp usampler2D uTex;
 uniform int uStep;
 uniform float uF;
-out vec4 o;
+out uvec2 o;
 void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
   ivec2 sz = textureSize(uTex, 0);
+  uint side = texelFetch(uTex, p, 0).x & 0x8000u;
   vec2 pc = (vec2(p) + 0.5) * uF;
-  vec4 best = vec4(-1.0);
-  float bi = 1e30, bo = 1e30;
+  uvec2 best = uvec2(0u, 0xFFFFu);
+  float bd = 1e30;
   for (int y = -1; y <= 1; y++) {
     for (int x = -1; x <= 1; x++) {
       ivec2 q = p + ivec2(x, y) * uStep;
       if (q.x < 0 || q.y < 0 || q.x >= sz.x || q.y >= sz.y) continue;
-      vec4 s = texelFetch(uTex, q, 0);
-      if (s.x >= 0.0) {
-        vec2 d = pc - s.xy;
-        float dd = dot(d, d);
-        if (dd < bi) { bi = dd; best.xy = s.xy; }
-      }
-      if (s.z >= 0.0) {
-        vec2 d = pc - s.zw;
-        float dd = dot(d, d);
-        if (dd < bo) { bo = dd; best.zw = s.zw; }
-      }
+      uvec2 s = texelFetch(uTex, q, 0).xy;
+      uvec2 c;
+      if ((s.x & 0x8000u) != side) c = uvec2(q);           // q 가 반대편 → q 자신이 후보
+      else if (s.y != 0xFFFFu) c = uvec2(s.x & 0x7FFFu, s.y); // q 가 아는 반대편 픽셀
+      else continue;
+      vec2 d = pc - (vec2(c) + 0.5) * uF;
+      float dd = dot(d, d);
+      if (dd < bd) { bd = dd; best = c; }
     }
   }
-  o = best;
+  o = uvec2(side | best.x, best.y);
 }`;
 
 /** 배경색과 확실히 다른 색인지 (0..1) — '꽉 찬 영역' 판단의 재료 */
@@ -579,7 +597,8 @@ uniform vec4 uBgImgXf;
 uniform int uShadowOn;
 uniform vec4 uShadowP;     // xy: 오프셋(출력 uv), z: 불투명도
 uniform vec3 uShadowColor;
-uniform sampler2D uDist;       // 테두리용 거리장 (FS_JFA_*)
+uniform highp usampler2D uDist; // 테두리용 거리장 (FS_JFA_*)
+uniform float uDistF;          // 거리장 1픽셀 = 원본 몇 px (1 또는 2)
 uniform vec2 uSrcSize;
 uniform int uOutlineOn;
 uniform int uOutlinePos;       // 0 바깥, 1 가운데, 2 안쪽
@@ -647,10 +666,17 @@ void main() {
   float sA = 0.0;
   if (uHasMask == 1 && uOutlineOn == 1) {
     ivec2 dsz = textureSize(uDist, 0);
-    vec4 nn = texelFetch(uDist, clamp(ivec2(suv * vec2(dsz)), ivec2(0), dsz - 1), 0);
+    ivec2 dp = clamp(ivec2(suv * vec2(dsz)), ivec2(0), dsz - 1);
+    uvec2 nn = texelFetch(uDist, dp, 0).xy;
+    bool isFg = (nn.x & 0x8000u) != 0u;           // 이 자리 자체가 피사체 쪽인지
+    bool hasOther = nn.y != 0xFFFFu;
+    vec2 own = (vec2(dp) + 0.5) * uDistF;          // 자기 자신 (원본 px)
+    vec2 other = (vec2(uvec2(nn.x & 0x7FFFu, nn.y)) + 0.5) * uDistF;  // 가장 가까운 반대편
+    vec2 nFg = isFg ? own : other;                 // 가장 가까운 피사체 픽셀
+    vec2 nBg = isFg ? other : own;                 // 가장 가까운 배경 픽셀
     vec2 sp = suv * uSrcSize;
-    float dOut = nn.x >= 0.0 ? max(0.0, length(sp - nn.xy) - 0.5) : 1e5;
-    float dIn = nn.z >= 0.0 ? max(0.0, length(sp - nn.zw) - 0.5) : 1e5;
+    float dOut = isFg || hasOther ? max(0.0, length(sp - nFg) - 0.5) : 1e5;
+    float dIn = !isFg || hasOther ? max(0.0, length(sp - nBg) - 0.5) : 1e5;
     float sd = m >= 0.5 ? -dIn : dOut;            // + 바깥, - 안쪽
     float W = uOutlineW;
     float ob = uOutlinePos == 0 ? W : (uOutlinePos == 1 ? W * 0.5 : 0.0);  // 띠의 가장 바깥
@@ -751,8 +777,10 @@ uniform int uHasSel;
 uniform float uTime;
 out vec4 o;
 
-float selAt(vec2 uv) {
-  return (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) ? 0.0 : texture(uSel, uv).r;
+/** 선택 영역의 원본 칸 하나가 선택됐는지 (사진 밖은 선택 안 됨) */
+bool selTex(ivec2 p, ivec2 ts) {
+  if (p.x < 0 || p.y < 0 || p.x >= ts.x || p.y >= ts.y) return false;
+  return texelFetch(uSel, p, 0).r > 0.5;
 }
 
 vec4 sampleSrc(vec2 suv, bool crisp) {
@@ -769,8 +797,6 @@ void main() {
   vec2 op = vp + uView.xy;
   vec2 ouv = op / uOut;
   vec2 suv = (uOrient * vec3(ouv, 1.0)).xy;
-  vec2 sdx = dFdx(suv);
-  vec2 sdy = dFdy(suv);
   if (vp.x < 0.0 || vp.y < 0.0 || vp.x >= uView.z || vp.y >= uView.w) {
     o = vec4(uWork, 1.0);
     return;
@@ -803,12 +829,30 @@ void main() {
   if (uShade.z > 0.0) {
     if (op.x < uShade.x || op.y < uShade.y || op.x > uShade.x + uShade.z || op.y > uShade.y + uShade.w) col *= 0.35;
   }
-  // 선택 영역 테두리 (움직이는 점선)
+  // 선택 영역 테두리: 짧은 흑백 점선이 테두리를 따라 흘러간다 (깜빡이지 않게 1px 씩 밀기 · uTime = 밀린 px).
+  // 원본 칸(텍셀) 단위로 '선택된 칸 중 바로 옆 칸이 선택 안 된 곳'을 찾는다 — 보간 없이 정확히.
+  // 확대 보기에서는 그 칸 안에서도 바깥쪽 경계에 닿은 화면 1px 만, 축소 보기에서는 화면 1px 거리만큼 떨어진 칸까지 본다
   if (uHasSel == 1) {
-    bool in0 = selAt(suv) > 0.5;
-    bool edge = in0 != (selAt(suv + sdx) > 0.5) || in0 != (selAt(suv - sdx) > 0.5) ||
-                in0 != (selAt(suv + sdy) > 0.5) || in0 != (selAt(suv - sdy) > 0.5);
-    if (edge) col = vec3(mod(floor((sp.x + sp.y) / 4.0 + uTime), 2.0));
+    ivec2 ts = textureSize(uSel, 0);
+    vec2 tp = suv * vec2(ts);
+    ivec2 c = ivec2(floor(tp));
+    // 화면 1px 이 원본에서 얼마나 되는지는 미분(dFdx) 대신 유니폼으로 계산한다 — 미분은 아래처럼 갈라지는
+    // 분기 안에서 쓰이면 GPU 에 따라 0 이 되어 테두리 일부(오른쪽·아래쪽)가 빠졌다
+    mat2 lin = mat2(uOrient);
+    vec2 dxt = (lin * vec2(1.0 / (uZoom * uOut.x), 0.0)) * vec2(ts);
+    vec2 dyt = (lin * vec2(0.0, 1.0 / (uZoom * uOut.y))) * vec2(ts);
+    float kx = max(max(abs(dxt.x), abs(dyt.x)), 1e-4); // 화면 1px 당 원본 칸 수 (가로 칸 방향)
+    float ky = max(max(abs(dxt.y), abs(dyt.y)), 1e-4);
+    int rx = int(max(1.0, ceil(kx))), ry = int(max(1.0, ceil(ky)));
+    vec2 f = tp - vec2(c);
+    bool e = false;
+    if (selTex(c, ts)) {
+      if (!selTex(c + ivec2(rx, 0), ts) && (rx > 1 || (1.0 - f.x) <= kx)) e = true;
+      if (!selTex(c - ivec2(rx, 0), ts) && (rx > 1 || f.x <= kx)) e = true;
+      if (!selTex(c + ivec2(0, ry), ts) && (ry > 1 || (1.0 - f.y) <= ky)) e = true;
+      if (!selTex(c - ivec2(0, ry), ts) && (ry > 1 || f.y <= ky)) e = true;
+    }
+    if (e) col = vec3(mod(floor((sp.x + sp.y - uTime) / 4.0), 2.0) < 1.0 ? 0.0 : 1.0);
   }
   o = vec4(col, 1.0);
 }`;

@@ -7,9 +7,11 @@ import {
   getRenderer,
   openFromPicker,
   sampleSourceColor,
+  pickBackground,
   screenToSource,
   setRenderer,
 } from "../actions";
+import { KIND } from "../kinds";
 import { cancelDrafts, toolDoubleClick, toolDown, toolMove, toolUp } from "../selectTools";
 import { getSelection } from "../selection";
 import { useStore, viewImageOffset, viewImageSize, type State, type Tool } from "../store";
@@ -19,7 +21,7 @@ import { useHisto } from "./controls/HistogramView";
 import { CropOverlay } from "./CropOverlay";
 import { useSmoothProgress } from "./useSmoothProgress";
 
-const SEL_TOOLS = new Set<Tool>(["marquee", "lasso", "wand", "pen"]);
+const SEL_TOOLS = new Set<Tool>(["marquee", "lasso", "wand", "pen", "colorrange"]);
 
 /** 스페이스바(임시 손 도구) 상태 */
 export const useKeys = create<{ space: boolean }>(() => ({ space: false }));
@@ -76,6 +78,7 @@ export function Viewport() {
   const hasMask = useStore((s) => !!s.doc.cutout);
   const busy = useStore((s) => s.busy);
   const job = useStore((s) => s.job);
+  const kind = useStore((s) => s.kind);
   const space = useKeys((s) => s.space);
   const prog = useSmoothProgress(job);
   const hasSel = useStore((s) => !!s.sel.box);
@@ -124,7 +127,8 @@ export function Viewport() {
   useEffect(() => {
     if (!hasSel) return;
     let t = 0;
-    const id = window.setInterval(() => getRenderer()?.setTime(++t), 110);
+    // 1px 씩 (8px 주기) 밀어서 점선이 테두리를 따라 도는 것처럼 — 예전처럼 한 번에 뒤집혀 깜빡이지 않게
+    const id = window.setInterval(() => getRenderer()?.setTime((t = (t + 1) % 8)), 60);
     return () => clearInterval(id);
   }, [hasSel]);
 
@@ -231,9 +235,14 @@ export function Viewport() {
       }
       return;
     }
+    if (s.tool === "bgpick") {
+      const sp = screenToSource(p.x, p.y);
+      if (sp) pickBackground(sp[0], sp[1]);
+      return;
+    }
     if (s.tool === "brush") {
       if (!s.doc.cutout) {
-        s.toast("먼저 '자동 누끼 따기'를 실행하거나 '직접 그려서 만들기'를 선택하세요.", "info", 4000);
+        s.toast("먼저 오른쪽 누끼 탭에서 '누끼 따기'를 눌러 주세요.", "info", 4000);
         return;
       }
       const sp = screenToSource(p.x, p.y);
@@ -311,12 +320,14 @@ export function Viewport() {
   if (image) {
     if (space || tool === "hand") cssCursor = dragging ? "grabbing" : "grab";
     else if (tool === "zoom") cssCursor = "zoom-in";
-    else if (tool === "eyedropper" || SEL_TOOLS.has(tool)) cssCursor = "crosshair";
+    else if (tool === "eyedropper" || tool === "bgpick" || SEL_TOOLS.has(tool)) cssCursor = "crosshair";
     else if (tool === "brush") cssCursor = hasMask ? "none" : "not-allowed";
   }
 
   const brushPx = (brush.size * zoom) / dpr;
   const showBrush = image && tool === "brush" && hasMask && cursor && !space && !dragging;
+  // 마술봉·색 범위: 선택이 있으면 끌어서 문지를 붓 크기를 보여 준다
+  const showSelBrush = image && (tool === "wand" || tool === "colorrange") && hasSel && cursor && !space && brushPx >= 6;
   const badge = compare ? "원본 보기 (보정 전)" : hasMask && viewMode !== "normal" ? MODE_LABEL[viewMode] : null;
 
   return (
@@ -347,7 +358,7 @@ export function Viewport() {
             </p>
             <div className="drop-steps">
               <span><i>1</i>사진 열기</span>
-              <span><i>2</i>자동 누끼 · 색감 보정</span>
+              <span><i>2</i>누끼 따기 · 색감 보정</span>
               <span><i>3</i>내보내기</span>
             </div>
             <div className="formats">JPG · PNG · WEBP · HEIC · BMP · GIF 지원</div>
@@ -380,6 +391,8 @@ export function Viewport() {
         )
       )}
 
+      {showSelBrush && <div className="brush-cursor sel" style={{ left: cursor!.x, top: cursor!.y, width: brushPx, height: brushPx }} />}
+
       {split !== null && !compare && image && (
         <>
           <div
@@ -406,7 +419,7 @@ export function Viewport() {
         <div style={{ position: "absolute", left: "50%", bottom: 20, transform: "translateX(-50%)", zIndex: 6 }}>
           <div className="busy-card" style={{ minWidth: 340 }}>
             <div className="row" style={{ marginBottom: 10 }}>
-              <span style={{ fontWeight: 650, flex: 1 }}>AI 누끼 진행 중</span>
+              <span style={{ fontWeight: 650, flex: 1 }}>{KIND[kind].label} 누끼 따는 중</span>
               <span className="muted small" style={{ fontVariantNumeric: "tabular-nums" }}>
                 {Math.round(prog * 100)}%
               </span>

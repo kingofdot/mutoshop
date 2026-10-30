@@ -2,17 +2,25 @@
 import type { Renderer } from "./gl/renderer";
 import { cancelJob, fetchResult, fetchStatus, pollJob, serverDecode, startCutout } from "./lib/api";
 import { autoAdjust as computeAuto } from "./lib/autoAdjust";
+import { despeckle } from "./lib/despeckle";
+import { clearPendingOrigin, expectOrigin, type FileHandleLike } from "./origin";
 import { presetToAdjust, type Preset } from "./lib/presets";
 import { confirmAsk } from "./dialog";
 import { clearResources, newId, resources } from "./resources";
 import { hasUnsaved, useStore } from "./store";
-import { defaultAdjust, defaultDoc, defaultEdge, outputSize, type Rect, type Target } from "./types";
+import { KIND, fineFor } from "./kinds";
+import { defaultAdjust, defaultDoc, defaultEdge, defaultOutlineWidth, outputSize, type CutKind, type Inner, type Rect, type Target } from "./types";
 import { orientMatrix, outToSrc, srcToOut } from "./gl/params";
 import { clearSelection } from "./selection";
 
 let renderer: Renderer | null = null;
 export const setRenderer = (r: Renderer | null) => (renderer = r);
 export const getRenderer = () => renderer;
+
+/** 폴더 일괄 처리 중에는 다른 사진을 열지 않는다 */
+let batchActive = false;
+export const setBatchActive = (v: boolean) => (batchActive = v);
+export const isBatchActive = () => batchActive;
 
 const MAX_SIDE = 12000;
 const MAX_PIXELS = 40_000_000;
@@ -45,6 +53,10 @@ async function decode(file: Blob): Promise<ImageBitmap> {
 
 export async function openImage(file: Blob, name: string) {
   const st = useStore.getState();
+  if (batchActive) {
+    toast("폴더 작업이 끝난 뒤에 열어 주세요.", "info");
+    return;
+  }
   if (st.job) {
     toast("누끼 작업이 끝난 뒤에 열어 주세요.", "info");
     return;
@@ -78,27 +90,10 @@ export async function openImage(file: Blob, name: string) {
     ctx.drawImage(bmp, 0, 0);
     bmp.close();
     const data = ctx.getImageData(0, 0, w, h).data;
-    let hasAlpha = false;
-    for (let i = 3; i < data.length; i += 4) {
-      if (data[i] < 255) {
-        hasAlpha = true;
-        break;
-      }
-    }
-    clearResources();
-    resources.source = { name, w, h, data, hasAlpha, version: ++srcVersion };
-    const doc = defaultDoc();
-    if (hasAlpha) {
-      // 이미 투명 배경인 PNG → 투명도를 누끼 마스크로 사용
-      const mask = new Uint8Array(w * h);
-      for (let i = 0; i < w * h; i++) mask[i] = data[i * 4 + 3];
-      const maskId = newId("m");
-      resources.masks.set(maskId, { w, h, data: mask });
-      doc.cutout = { maskId, fgId: null, source: "alpha" };
-      doc.bg.mode = "transparent";
-    }
-    clearSelection();
-    useStore.getState().loadDoc({ name, w, h, version: srcVersion }, doc);
+    // 디코드용 캔버스 메모리는 GC 를 기다리지 않고 바로 돌려준다
+    cv.width = 0;
+    cv.height = 0;
+    loadSourceData(name, w, h, data);
     if (note) toast(note, "info", 5000);
   } catch (e) {
     console.error(e);
@@ -106,6 +101,92 @@ export async function openImage(file: Blob, name: string) {
   } finally {
     useStore.getState().set({ busy: null });
   }
+}
+
+/** 잔티 제거를 지금 설정대로 적용한 마스크 정보 (지울 점이 없으면 원래 마스크 그대로) */
+function cleanSpecks(rawId: string, w: number, h: number): { maskId: string; rawMaskId?: string; specks?: number } {
+  const size = useStore.getState().despeckle;
+  const raw = resources.masks.get(rawId);
+  if (!size || !raw) return { maskId: rawId };
+  const r = despeckle(raw.data, w, h, size);
+  if (!r.removed) return { maskId: rawId };
+  const id = newId("m");
+  resources.masks.set(id, { w, h, data: r.data });
+  return { maskId: id, rawMaskId: rawId, specks: r.removed };
+}
+
+/** 잔티 제거 켜기·끄기·크기 바꾸기. 지금 결과에도 바로 적용된다 (실행 취소 가능) */
+export function setDespeckle(size: number) {
+  const st = useStore.getState();
+  size = Math.max(0, Math.min(50, Math.round(size)));
+  st.set({ despeckle: size });
+  const cut = st.doc.cutout;
+  if (!cut || cut.source !== "ai" || !st.image) return;
+  const rawId = cut.rawMaskId ?? cut.maskId;
+  const ds = cleanSpecks(rawId, st.image.w, st.image.h);
+  if (ds.maskId === cut.maskId) return;
+  st.change(size ? `잔티 제거 (${size}px 이하)` : "잔티 제거 끄기", (d) => {
+    if (!d.cutout) return;
+    d.cutout.maskId = ds.maskId;
+    d.cutout.rawMaskId = ds.rawMaskId;
+    d.cutout.specks = ds.specks;
+  });
+}
+
+/** 지금 열린 사진만 닫는다 (Ctrl+W · 파일 › 닫기). 저장하지 않은 변경이 있으면 먼저 묻는다 */
+export async function closeImage() {
+  const st = useStore.getState();
+  if (!st.image) return;
+  if (batchActive) {
+    toast("폴더 작업이 끝난 뒤에 닫아 주세요.", "info");
+    return;
+  }
+  if (st.job) {
+    toast("누끼 작업이 끝난 뒤에 닫아 주세요.", "info");
+    return;
+  }
+  if (hasUnsaved()) {
+    const ok = await confirmAsk({
+      title: "사진을 닫을까요?",
+      body: "저장하지 않은 편집 내용은 사라집니다.",
+      ok: "닫기",
+      cancel: "취소",
+    });
+    if (!ok) return;
+  }
+  clearSelection();
+  clearResources();
+  resources.source = null;
+  useStore.setState({
+    image: null, doc: defaultDoc(), hist: [], histIndex: -1, savedIndex: 0, lastSave: null,
+    penPath: null, cropDraft: null, tool: "hand", viewMode: "normal", compare: false, split: null,
+  });
+}
+
+/** 픽셀 데이터를 새 문서로 연다 (확인 없이). 이미 투명한 이미지는 투명도를 누끼 마스크로 쓴다. */
+export function loadSourceData(name: string, w: number, h: number, data: Uint8ClampedArray) {
+  let hasAlpha = false;
+  for (let i = 3; i < data.length; i += 4) {
+    if (data[i] < 255) {
+      hasAlpha = true;
+      break;
+    }
+  }
+  clearResources();
+  resources.source = { name, w, h, data, hasAlpha, version: ++srcVersion };
+  const doc = defaultDoc();
+  doc.outline.width = defaultOutlineWidth(w, h); // 1024 이하 1px · 넘으면 2px
+  if (hasAlpha) {
+    // 이미 투명 배경인 PNG → 투명도를 누끼 마스크로 사용
+    const mask = new Uint8Array(w * h);
+    for (let i = 0; i < w * h; i++) mask[i] = data[i * 4 + 3];
+    const maskId = newId("m");
+    resources.masks.set(maskId, { w, h, data: mask });
+    doc.cutout = { maskId, fgId: null, source: "alpha" };
+    doc.bg.mode = "transparent";
+  }
+  clearSelection();
+  useStore.getState().loadDoc({ name, w, h, version: srcVersion }, doc);
 }
 
 export function pickFile(accept = "image/*"): Promise<File | null> {
@@ -120,8 +201,46 @@ export function pickFile(accept = "image/*"): Promise<File | null> {
 }
 
 export async function openFromPicker() {
+  // 파일 핸들을 주는 열기 창이 있으면 그것으로 (나중에 '원본에 덮어쓰기'를 할 수 있게)
+  const w = window as unknown as {
+    showOpenFilePicker?: (o: unknown) => Promise<FileHandleLike[]>;
+  };
+  if (w.showOpenFilePicker) {
+    try {
+      const [h] = await w.showOpenFilePicker({
+        multiple: false,
+        excludeAcceptAllOption: false,
+        types: [{
+          description: "이미지",
+          accept: { "image/*": [".png", ".jpg", ".jpeg", ".jfif", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".heic", ".heif", ".avif"] },
+        }],
+      });
+      if (!h) return;
+      const f = await h.getFile();
+      expectOrigin({ kind: "file", handle: h, name: f.name });
+      await openImage(f, f.name);
+      clearPendingOrigin();
+      return;
+    } catch (e) {
+      clearPendingOrigin();
+      if ((e as DOMException).name === "AbortError") return;
+      // 열기 창이 막혀 있으면 예전 방식으로
+    }
+  }
   const f = await pickFile("image/*,.heic,.heif");
   if (f) await openImage(f, f.name);
+}
+
+/** 끌어다 놓은 파일 열기 (핸들을 주면 원본 덮어쓰기가 된다) */
+export async function openDropped(f: File, handle?: Promise<unknown> | null) {
+  if (handle) {
+    expectOrigin(handle.then((h) => {
+      const fh = h as FileHandleLike | null;
+      return fh && fh.kind === "file" ? { kind: "file" as const, handle: fh, name: f.name } : null;
+    }, () => null));
+  }
+  await openImage(f, f.name);
+  clearPendingOrigin();
 }
 
 // ---------------------------------------------------------------------------
@@ -129,60 +248,90 @@ export async function openFromPicker() {
 
 let cutoutToken: object | null = null;
 
-export async function runCutout() {
+export const SERVER_DOWN = "서버에 연결할 수 없어요. 바탕 화면 아이콘으로 프로그램을 다시 켜 주세요.";
+
+export interface CutoutRequest {
+  /** 무엇을 따는지 (나무·산·아이템·인물) — 사용자가 고른 종류. 종류마다 피사체를 지키는 방식이 다르다 */
+  kind: CutKind;
+  /** 피사체 안쪽에 갇힌 배경색: 종류대로 / 남기기 / 지우기 */
+  inner: Inner;
+  /** 인물 사진의 머리카락 최고 품질 (인물에서만 의미 있음) */
+  fine: boolean;
+  /** 배경 찍기: 찍은 자리 (원본 px) */
+  seeds?: [number, number][];
+  /** 배경 찍기와 함께 테두리 배경도 자동으로 지울지 */
+  border?: boolean;
+}
+
+export interface CutoutResult {
+  /** asset: 단색 배경이라 배경색으로 땀 · ai: 사진이라 AI 로 땀 */
+  method: "asset" | "ai";
+  /** 서버 알림 (예: 메모리가 부족해 가벼운 방식으로 땄음) */
+  note: string | null;
+}
+
+/** 지금 열린 사진의 누끼를 딴다. 실패하면 예외, 취소되면 null */
+export async function cutoutCurrent(o: CutoutRequest): Promise<CutoutResult | null> {
   const st = useStore.getState();
   const src = resources.source;
-  if (!src || st.job) return;
-  if (!st.server?.ok) {
-    const info = await refreshServer();
-    if (!info.ok) {
-      toast("AI 서버에 연결할 수 없습니다. start.bat 으로 프로그램을 실행했는지 확인해 주세요.", "error", 6000);
-      return;
-    }
-  }
+  if (!src) throw new Error("이미지가 없습니다.");
+  if (st.job) throw new Error("이미 누끼 작업 중입니다.");
   const token = {};
   cutoutToken = token;
   const alive = () => cutoutToken === token;
   const setJob = (j: Parameters<typeof st.set>[0]["job"]) => alive() && useStore.getState().set({ job: j });
+  // 서버 확인보다 먼저 작업 중으로 표시 (확인하는 사이 두 번 눌러도 한 번만 돌게)
   setJob({ id: "", state: "queued", stage: "upload", progress: 0, message: "이미지 보내는 중" });
   let id = "";
+  let method: "asset" | "ai" = "ai";
+  let note: string | null = null;
   try {
-    id = await startCutout(src, useStore.getState().model, useStore.getState().precise);
-    if (!alive()) return;
+    if (!st.server?.ok) {
+      const info = await refreshServer();
+      if (!alive()) return null;
+      if (!info.ok) throw new Error(SERVER_DOWN);
+    }
+    id = await startCutout(src, o.kind, o.inner, fineFor(o.kind, o.fine), o.seeds, o.border !== false);
+    if (!alive()) return null;
     setJob({ id, state: "queued", stage: "queued", progress: 0.02, message: "준비 중" });
     for (;;) {
       await sleep(250);
-      if (!alive()) return;
+      if (!alive()) return null;
       const j = await pollJob(id);
       if (j.state === "error") throw new Error(j.error || "알 수 없는 오류");
-      if (j.state === "cancelled") return;
+      if (j.state === "cancelled") return null;
       setJob({ id, state: j.state, stage: j.stage, progress: j.progress, message: j.message });
-      if (j.state === "done") break;
+      if (j.state === "done") {
+        note = j.note || null;
+        if (j.method === "asset") method = "asset";
+        break;
+      }
     }
     setJob({ id, state: "done", stage: "fetch", progress: 1, message: "결과 불러오는 중" });
     const [mask, fg] = await Promise.all([fetchResult(id, "mask"), fetchResult(id, "fg")]);
-    if (!alive() || resources.source !== src) return; // 취소했거나 그 사이 다른 이미지를 열었음
-    const maskId = newId("m");
+    if (!alive() || resources.source !== src) return null; // 취소했거나 그 사이 다른 이미지를 열었음
+    const rawId = newId("m");
     const fgId = newId("f");
-    resources.masks.set(maskId, { w: src.w, h: src.h, data: mask });
+    resources.masks.set(rawId, { w: src.w, h: src.h, data: mask });
     resources.fgs.set(fgId, { w: src.w, h: src.h, data: fg });
-    useStore.getState().change("자동 누끼", (d) => {
-      d.cutout = { maskId, fgId, source: "ai" };
+    // 잔티 제거 (기본 켬): 주요 객체와 떨어진 작은 점. 끄면 rawMaskId 로 바로 되돌린다
+    const ds = cleanSpecks(rawId, src.w, src.h);
+    const picked = !!o.seeds?.length;
+    useStore.getState().change(picked ? "배경 찍기" : `누끼 · ${KIND[o.kind].label}`, (d) => {
+      d.cutout = picked
+        ? { ...ds, fgId, source: "ai", kind: o.kind, seeds: o.seeds, border: o.border !== false }
+        : { ...ds, fgId, source: "ai", kind: o.kind };
       d.strokes = [];
       d.invert = false;
+      d.edge = defaultEdge(); // 이전 누끼의 테두리 설정이 새 결과를 망치지 않게
       if (d.bg.mode === "original") d.bg.mode = "transparent";
     });
-    // 배경이 단색(흰 배경 사진·일러스트 등)이면 흰 테두리 제거까지 바로 적용 — Ctrl+Z 한 번으로 해제
-    const bgInfo = detectBackground();
-    if (bgInfo.uniform && bgInfo.light) {
-      removeFringe(true);
-      toast("누끼 완료! 흰 배경이라 테두리에 섞인 흰색도 자동으로 걷어 냈어요. (Ctrl+Z로 해제)", "success", 5000);
-    } else {
-      toast("누끼 완료! 브러시로 세밀하게 다듬거나 배경을 바꿔 보세요.", "success", 4000);
-    }
+    // 흰 테두리 제거(투명도 다시 계산)는 자동으로 하지 않는다. 투명도는 서버가 확정하고, 편집기에서 색으로
+    // 다시 계산하면 배경과 비슷한 흰 칼날·눈·꽃잎이 깎일 수 있다 (피사체는 반드시 지킨다)
+    return { method, note };
   } catch (e) {
-    console.error(e);
-    if (alive()) toast(`누끼에 실패했어요: ${(e as Error).message}`, "error", 7000);
+    if (!alive()) return null; // 취소한 뒤에 난 오류는 무시
+    throw e;
   } finally {
     if (id) cancelJob(id); // 서버 메모리 정리
     if (alive()) {
@@ -190,6 +339,46 @@ export async function runCutout() {
       useStore.getState().set({ job: null });
     }
     refreshServer();
+  }
+}
+
+/** 누끼 따기: 고른 종류(kind 를 주면 그 종류로 바꾸고)와 고급 설정(안쪽 배경색 · 머리카락 최고 품질)으로 */
+export async function runCutout(kind?: CutKind) {
+  const st = useStore.getState();
+  if (!resources.source || st.job) return;
+  if (kind && kind !== st.kind) st.setKind(kind);
+  const s = useStore.getState();
+  const k = s.kind;
+  try {
+    const r = await cutoutCurrent({ kind: k, inner: s.inner, fine: fineFor(k, s.fine) });
+    if (!r) return;
+    // 서버 알림은 메모리가 모자라 가벼운 방식으로 바뀌었다는 걸 알려 주는 유일한 신호라 길게 보여 준다
+    if (r.note) toast(r.note, "info", 8000);
+    else toast(`누끼 완료 (${KIND[k].label}) · 지워진 곳은 복원 브러시(B)로 되살려요.`, "success", 4500);
+  } catch (e) {
+    console.error(e);
+    toast(`누끼에 실패했어요: ${(e as Error).message}`, "error", 7000);
+  }
+}
+
+/** 배경 찍기: 클릭한 배경(원본 px)과 이어진 배경을 지운다.
+ *  자동 누끼 결과 위에서 찍으면 그 결과에 더하고(고리 안쪽 같은 구멍), 아직 누끼가 없으면 찍은 곳만 지운다.
+ *  윤곽선이 조금 끊긴 곳으로는 새지 않고, 아이템·산·인물은 AI 가 객체(흰 칼날 등)를 한 번 더 지킨다 */
+export async function pickBackground(x: number, y: number) {
+  const st = useStore.getState();
+  const src = resources.source;
+  if (!src || st.job) return;
+  if (x < 0 || y < 0 || x >= src.w || y >= src.h) return;
+  const cut = st.doc.cutout;
+  const prev = cut?.source === "ai" ? cut.seeds ?? [] : [];
+  const border = cut?.source === "ai" ? (cut.seeds ? cut.border !== false : true) : false;
+  const seeds: [number, number][] = [...prev, [Math.round(x), Math.round(y)]];
+  try {
+    const r = await cutoutCurrent({ kind: st.kind, inner: st.inner, fine: false, seeds, border });
+    if (r?.note) toast(r.note, "info", 6000);
+  } catch (e) {
+    console.error(e);
+    toast(`배경 찍기에 실패했어요: ${(e as Error).message}`, "error", 6000);
   }
 }
 
@@ -249,39 +438,60 @@ export function detectBackground(): { color: string; uniform: boolean; light: bo
 
 export const detectMatteColor = () => detectBackground().color;
 
-/** 흰 테두리(원래 배경색 번짐) 한 번에 제거: 배경색 빼기 + 가장자리 색 채우기 */
+/** 흰 테두리(원래 배경색 번짐) 한 번에 제거: 배경색 빼기 + 가장자리 색 채우기.
+ *  종류를 골라 딴 결과는 색만 고치고 투명도는 그대로 둔다 — 투명도를 색으로 다시 계산하면
+ *  배경과 비슷한 흰 칼날·눈·꽃잎 가장자리가 깎일 수 있다 (투명도 다시 계산은 고급 설정에서 직접) */
 export function removeFringe(silent = false) {
   const s = useStore.getState();
-  if (!s.doc.cutout) return;
-  const alpha = s.doc.cutout.source === "alpha";
+  const cut = s.doc.cutout;
+  if (!cut) return;
+  const alpha = cut.source === "alpha";
+  const protect = !!cut.kind;
   const bg = detectBackground();
   s.change("흰 테두리 제거", (d) => {
     d.edge.deconMode = "matte";
     d.edge.matteSource = alpha ? "color" : "auto";
     if (alpha) d.edge.matteColor = "#ffffff";
     d.edge.decontaminate = 100;
-    // 배경이 단색이면 투명도도 색으로 다시 계산 (가지·털 사이에 남은 흰 안개 제거).
-    // 그러면 색도 정확히 되돌아오므로 색 채우기는 필요 없다. 아니면 색 채우기로 남은 기운을 덮는다.
     if (!alpha && bg.uniform && !d.invert) {
-      d.edge.colorAlpha = 100;
       // 단색 배경은 위치마다 추정하는 것보다 감지한 한 가지 색이 더 정확하다 (실험으로 확인)
       d.edge.matteSource = "color";
       d.edge.matteColor = bg.color;
+    }
+    if (!alpha && bg.uniform && !d.invert && !protect) {
+      // 직접 만든 마스크: 투명도도 색으로 다시 계산 (가지·털 사이에 남은 흰 안개 제거).
+      // 그러면 색도 정확히 되돌아오므로 색 채우기는 필요 없다
+      d.edge.colorAlpha = 100;
       d.edge.defringe = 0;
     } else {
+      // 색 채우기로 남은 기운을 덮는다 (투명도는 그대로)
       d.edge.defringe = Math.max(d.edge.defringe, 2);
     }
     if (d.bg.mode === "original") d.bg.mode = "transparent";
   });
-  if (!silent) s.toast(alpha ? "흰색 배경이 섞인 테두리를 걷어 냈어요. 다른 색이 섞였다면 배경색을 직접 지정하세요." : "테두리에 섞인 원래 배경색을 걷어 냈어요.", "success", 4000);
+  if (!silent) {
+    s.toast(
+      alpha ? "흰색 배경이 섞인 테두리를 걷어 냈어요. 다른 색이 섞였다면 배경색을 직접 지정하세요."
+        : protect ? "테두리에 섞인 원래 배경색을 걷어 냈어요. 피사체 모양은 그대로 둬요."
+          : "테두리에 섞인 원래 배경색을 걷어 냈어요.",
+      "success", 4000,
+    );
+  }
 }
 
-export function resetMaskEdits() {
-  useStore.getState().change("마스크 수정 초기화", (d) => {
-    d.strokes = [];
-    d.invert = false;
+/** 고급 설정 되돌리기: 가장자리·테두리 색·마스크 반전만 (브러시로 다듬은 것은 그대로) */
+export function resetEdge() {
+  useStore.getState().change("가장자리 초기화", (d) => {
     d.edge = defaultEdge();
+    d.invert = false;
   });
+}
+
+/** 마스크 반전 (Ctrl+I) */
+export function toggleInvert() {
+  const s = useStore.getState();
+  if (!s.doc.cutout) return;
+  s.change(s.doc.invert ? "마스크 반전 해제" : "마스크 반전", (d) => { d.invert = !d.invert; });
 }
 
 // ---------------------------------------------------------------------------
@@ -511,7 +721,13 @@ export async function renderExport(o: ExportOptions): Promise<Blob> {
   const img = renderer.readOutput(r);
   if (!img) throw new Error("결과를 읽지 못했습니다.");
 
-  let canvas = document.createElement("canvas");
+  const made: HTMLCanvasElement[] = [];
+  const newCanvas = () => {
+    const c = document.createElement("canvas");
+    made.push(c);
+    return c;
+  };
+  let canvas = newCanvas();
   canvas.width = r.w;
   canvas.height = r.h;
   canvas.getContext("2d")!.putImageData(img, 0, 0);
@@ -520,7 +736,7 @@ export async function renderExport(o: ExportOptions): Promise<Blob> {
   if (b) {
     const pad = Math.round((Math.max(b.w, b.h) * o.padding) / 100);
     const [cw, ch] = o.layout === "trim" ? [b.w + pad * 2, b.h + pad * 2] : [Math.max(b.w, b.h) + pad * 2, Math.max(b.w, b.h) + pad * 2];
-    const out = document.createElement("canvas");
+    const out = newCanvas();
     out.width = cw;
     out.height = ch;
     const ctx = out.getContext("2d")!;
@@ -536,7 +752,7 @@ export async function renderExport(o: ExportOptions): Promise<Blob> {
     const sc = o.longSide / Math.max(canvas.width, canvas.height);
     const w = Math.max(1, Math.round(canvas.width * sc)), h = Math.max(1, Math.round(canvas.height * sc));
     const bmp = await createImageBitmap(canvas, { resizeWidth: w, resizeHeight: h, resizeQuality: "high" });
-    const out = document.createElement("canvas");
+    const out = newCanvas();
     out.width = w;
     out.height = h;
     out.getContext("2d")!.drawImage(bmp, 0, 0);
@@ -546,7 +762,7 @@ export async function renderExport(o: ExportOptions): Promise<Blob> {
 
   if (o.format === "jpeg") {
     // JPG 는 투명을 지원하지 않으므로 흰색(또는 단색 배경색) 위에 깔기
-    const out = document.createElement("canvas");
+    const out = newCanvas();
     out.width = canvas.width;
     out.height = canvas.height;
     const ctx = out.getContext("2d")!;
@@ -556,20 +772,26 @@ export async function renderExport(o: ExportOptions): Promise<Blob> {
     canvas = out;
   }
 
-  return new Promise((resolve, reject) =>
-    canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error("이미지 인코딩 실패"))), MIME[o.format], o.quality),
+  const blob = await new Promise<Blob>((resolve, reject) =>
+    canvas.toBlob((bl) => (bl ? resolve(bl) : reject(new Error("이미지 인코딩 실패"))), MIME[o.format], o.quality),
   );
+  // 캔버스 메모리는 GC 를 기다리지 않고 바로 돌려준다 (큰 사진 수십 장을 연달아 내보낼 때 메모리 부족 방지)
+  for (const c of made) {
+    c.width = 0;
+    c.height = 0;
+  }
+  return blob;
 }
 
 interface SaveFilePickerWindow {
   showSaveFilePicker?: (o: {
     suggestedName: string;
     types: { description: string; accept: Record<string, string[]> }[];
-  }) => Promise<{ createWritable: () => Promise<{ write: (b: Blob) => Promise<void>; close: () => Promise<void> }> }>;
+  }) => Promise<{ name: string; createWritable: () => Promise<{ write: (b: Blob) => Promise<void>; close: () => Promise<void> }> }>;
 }
 
-/** 저장 위치를 고를 수 있으면 고르게, 아니면 다운로드 폴더로 */
-export async function saveBlob(blob: Blob, filename: string, format: ExportFormat): Promise<boolean> {
+/** 저장 위치를 고를 수 있으면 고르게, 아니면 다운로드 폴더로. 저장한 파일 이름을 돌려준다 (취소하면 null) */
+export async function saveBlob(blob: Blob, filename: string, format: ExportFormat): Promise<string | null> {
   const w = window as unknown as SaveFilePickerWindow;
   if (w.showSaveFilePicker) {
     try {
@@ -580,9 +802,9 @@ export async function saveBlob(blob: Blob, filename: string, format: ExportForma
       const writable = await handle.createWritable();
       await writable.write(blob);
       await writable.close();
-      return true;
+      return handle.name || filename;
     } catch (e) {
-      if ((e as DOMException).name === "AbortError") return false;
+      if ((e as DOMException).name === "AbortError") return null;
     }
   }
   const a = document.createElement("a");
@@ -590,7 +812,7 @@ export async function saveBlob(blob: Blob, filename: string, format: ExportForma
   a.download = filename;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
-  return true;
+  return `${filename} (다운로드 폴더)`;
 }
 
 export async function copyToClipboard(o?: Partial<ExportOptions>) {

@@ -1,12 +1,12 @@
-import type { ReactNode } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import {
-  Brush, Check, Combine, Crop, Eraser, FlipHorizontal, Hand, Lasso, PenTool, Pipette, RotateCcw, RotateCw,
-  Square, SquareDashed, SquareMinus, SquarePlus, Undo2, Wand, X, ZoomIn,
+  Brush, Check, Crop, Droplets, Eraser, FlipHorizontal, Hand, Lasso, MousePointerClick, PenTool, Pipette, RotateCcw, RotateCw,
+  SquareDashed, SquareMinus, SquarePlus, Undo2, Wand, X, ZoomIn,
 } from "lucide-react";
-import { applyCrop, cancelCrop, flip, rotate } from "../actions";
+import { applyCrop, cancelCrop, clearCutout, flip, rotate } from "../actions";
 import { penApply, penToSelection } from "../selectTools";
-import { applySelection, clearSelection, invertSelection } from "../selection";
-import { useStore, type SelMode } from "../store";
+import { applySelection, clearSelection, growSelection, invertSelection } from "../selection";
+import { useStore } from "../store";
 import { outputSize } from "../types";
 import { fitAspect } from "./CropOverlay";
 
@@ -25,13 +25,13 @@ function Mini({ label, value, min, max, onChange, suffix = "" }: {
 }
 
 /** 브러시 크기는 로그 눈금으로 (작은 값도 세밀하게) */
-function SizeSlider() {
+function SizeSlider({ label = "크기" }: { label?: string }) {
   const size = useStore((s) => s.brush.size);
   const setBrush = useStore((s) => s.setBrush);
   const t = Math.round((Math.log(size / 2) / Math.log(1000)) * 1000);
   return (
     <div className="mini-slider">
-      <span className="opt-label">크기</span>
+      <span className="opt-label">{label}</span>
       <input type="range" min={0} max={1000} value={t} style={{ ["--p" as string]: `${t / 10}%` }}
         onChange={(e) => setBrush({ size: Math.max(2, Math.round(2 * Math.pow(1000, Number(e.target.value) / 1000))) })} />
       <span className="val">{size}px</span>
@@ -54,33 +54,70 @@ function Title({ icon, children }: { icon: ReactNode; children: ReactNode }) {
   return <div className="opt-title">{icon}{children}</div>;
 }
 
-const SEL_MODES: { v: SelMode; icon: ReactNode; tip: string }[] = [
-  { v: "new", icon: <Square size={15} />, tip: "새 선택" },
-  { v: "add", icon: <SquarePlus size={15} />, tip: "선택에 더하기 (Shift)" },
-  { v: "sub", icon: <SquareMinus size={15} />, tip: "선택에서 빼기 (Alt)" },
-  { v: "and", icon: <Combine size={15} />, tip: "겹치는 부분만 (Shift+Alt)" },
-];
+/** 누르면 한 번, 누르고 있으면 계속 (0.4초 뒤부터 빠르게 반복). Shift 를 누르고 있으면 5배 */
+export function useRepeat(fn: (shift: boolean) => void) {
+  const timer = useRef(0);
+  const stop = () => {
+    clearTimeout(timer.current);
+    clearInterval(timer.current);
+  };
+  useEffect(() => stop, []);
+  return {
+    onPointerDown: (e: React.PointerEvent) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      const shift = e.shiftKey;
+      stop();
+      fn(shift);
+      timer.current = window.setTimeout(() => {
+        timer.current = window.setInterval(() => fn(shift), 80);
+      }, 380);
+    },
+    onPointerUp: stop,
+    onPointerLeave: stop,
+    onPointerCancel: stop,
+    onKeyDown: (e: React.KeyboardEvent) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        fn(e.shiftKey);
+      }
+    },
+  };
+}
 
-function SelModeButtons() {
-  const mode = useStore((s) => s.selMode);
-  const set = useStore((s) => s.set);
+/** 선택 영역 1px 줄이기 / 넓히기. 선택 방식(더하기·빼기)은 Shift·Alt 를 누르고 클릭하면 된다 */
+function GrowButtons() {
+  const has = useStore((s) => !!s.sel.box);
+  const grow = useStore((s) => s.sel.grow);
+  const minus = useRepeat((sh) => growSelection(sh ? -5 : -1));
+  const plus = useRepeat((sh) => growSelection(sh ? 5 : 1));
   return (
-    <div className="row" style={{ gap: 2 }}>
-      {SEL_MODES.map((m) => (
-        <button key={m.v} className={`iconbtn${mode === m.v ? " active" : ""}`} data-tip={m.tip} onClick={() => set({ selMode: m.v })}>
-          {m.icon}
-        </button>
-      ))}
+    <div className="row grow-stepper" style={{ gap: 2 }}>
+      <button className="iconbtn" disabled={!has} {...minus}
+        data-tip="선택 영역 1px 줄이기 · 누르고 있으면 계속 · Shift 5px (Alt+-)">
+        <SquareMinus size={15} />
+      </button>
+      <span className={`grow-val tnum${grow ? " on" : ""}`} data-tip="처음 고른 선택에서 넓히거나(+) 줄인(−) 만큼">
+        {grow > 0 ? "+" : grow < 0 ? "−" : ""}{Math.abs(grow)}px
+      </span>
+      <button className="iconbtn" disabled={!has} {...plus}
+        data-tip="선택 영역 1px 넓히기 · 누르고 있으면 계속 · Shift 5px (Alt+=)">
+        <SquarePlus size={15} />
+      </button>
     </div>
   );
 }
 
 /** 선택 영역이 있을 때: 지우기 / 되살리기 / 이것만 남기기 / 반전 / 해제 */
-function SelActions() {
+function SelActions({ grow = true }: { grow?: boolean }) {
   const box = useStore((s) => s.sel.box);
-  if (!box) return <span className="opt-hint">영역을 선택한 뒤 Delete로 지우거나, ‘이것만 남기기’로 배경을 없애세요.</span>;
+  const area = useStore((s) => s.sel.area);
+  if (!box) return <span className="opt-hint">영역을 선택한 뒤 Delete로 지우거나, ‘이것만 남기기’로 배경을 없애세요. Shift+클릭 더하기 · Alt+클릭 빼기</span>;
   return (
     <div className="row" style={{ gap: 6 }}>
+      {grow && <GrowButtons />}
+      <span className="opt-label tnum" data-tip={`선택 영역 ${box.w}×${box.h}`}>{area.toLocaleString()}px 선택</span>
+      <span className="opt-sep" />
       <button className="btn sm danger" onClick={() => applySelection("delete")} data-tip="선택한 부분을 지움 (Delete)">
         <Eraser size={13} /> 지우기
       </button>
@@ -93,6 +130,18 @@ function SelActions() {
       <button className="btn sm ghost" onClick={invertSelection} data-tip="선택 반전 (Ctrl+Shift+I)">반전</button>
       <button className="btn sm ghost" onClick={clearSelection} data-tip="선택 해제 (Ctrl+D)">해제</button>
     </div>
+  );
+}
+
+/** 마술봉·색 범위: 끌어서 문지르면 선택에서 빼기 */
+function SelBrushHint() {
+  return (
+    <>
+      <span className="opt-sep" />
+      <span className="row" style={{ gap: 6 }} data-tip="사진 위를 끌어서 문지르면 그 부분이 선택에서 빠져요 · Shift+끌기 더하기 · [ ] 크기">
+        <SizeSlider label="문질러 빼기 붓" />
+      </span>
+    </>
   );
 }
 
@@ -111,12 +160,13 @@ function SelectionToolBar() {
     lasso: <Title icon={<Lasso size={16} />}>올가미</Title>,
     wand: <Title icon={<Wand size={16} />}>자동 선택</Title>,
     pen: <Title icon={<PenTool size={16} />}>펜</Title>,
-  }[tool as "marquee" | "lasso" | "wand" | "pen"];
+    colorrange: <Title icon={<Droplets size={16} />}>색 범위</Title>,
+  }[tool as "marquee" | "lasso" | "wand" | "pen" | "colorrange"];
 
   return (
     <div className="optionsbar">
       {title}
-      {tool !== "pen" && <SelModeButtons />}
+      {tool !== "pen" && <GrowButtons />}
       <span className="opt-sep" />
       {tool === "marquee" && (
         <div className="chip-row">
@@ -132,19 +182,29 @@ function SelectionToolBar() {
             data-tip="클릭해서 꼭짓점 찍기 · 더블클릭/첫 점 클릭으로 닫기">다각형</button>
         </div>
       )}
+      {tool === "colorrange" && (
+        <>
+          <WandTolerance color />
+          <button className={`chip${wand.antialias ? " on" : ""}`} onClick={() => setWand({ antialias: !wand.antialias })}
+            data-tip="경계를 부드럽게">앤티 앨리어스</button>
+          {!hasSel && <span className="opt-hint">지울 색을 클릭 → 사진 전체에서 비슷한 색이 선택돼요 · Shift+클릭 색 더하기 · Delete 지우기</span>}
+          {hasSel && <SelBrushHint />}
+        </>
+      )}
       {tool === "wand" && (
         <>
-          <Mini label="허용치" value={wand.tolerance} min={0} max={255} onChange={(v) => setWand({ tolerance: v })} />
+          <WandTolerance />
           <button className={`chip${wand.contiguous ? " on" : ""}`} onClick={() => setWand({ contiguous: !wand.contiguous })}
             data-tip="이어진 영역만 선택">인접</button>
           <button className={`chip${wand.antialias ? " on" : ""}`} onClick={() => setWand({ antialias: !wand.antialias })}
             data-tip="경계를 부드럽게">앤티 앨리어스</button>
+          {hasSel && <SelBrushHint />}
         </>
       )}
       {tool === "pen" && (
         path ? (
           <div className="row" style={{ gap: 6 }}>
-            <button className="btn sm" onClick={() => penToSelection(useStore.getState().selMode)}>선택 영역으로 <span className="kbd">Enter</span></button>
+            <button className="btn sm" onClick={() => penToSelection("new")}>선택 영역으로 <span className="kbd">Enter</span></button>
             <button className="btn sm danger" onClick={() => penApply("delete")}>경로 안쪽 지우기</button>
             <button className="btn sm primary" onClick={() => penApply("keep")}><Check size={13} /> 경로 안쪽만 남기기</button>
             <button className="btn sm ghost" onClick={() => set({ penPath: null })}>경로 지우기 <span className="kbd">Esc</span></button>
@@ -154,7 +214,7 @@ function SelectionToolBar() {
         )
       )}
       {(tool !== "pen" || hasSel) && <span className="opt-sep" />}
-      {(tool !== "pen" || hasSel) && <SelActions />}
+      {(tool !== "pen" || hasSel) && <SelActions grow={tool === "pen"} />}
     </div>
   );
 }
@@ -169,6 +229,7 @@ export function OptionsBar() {
   const draft = useStore((s) => s.cropDraft);
   const orient = useStore((s) => s.doc.orient);
   const eyeTarget = useStore((s) => s.eyedropperTarget);
+  const hasSel = useStore((s) => !!s.sel.box);
   const setBrush = useStore((s) => s.setBrush);
   const st = useStore.getState;
 
@@ -180,7 +241,7 @@ export function OptionsBar() {
     );
   }
 
-  if (tool === "marquee" || tool === "lasso" || tool === "wand" || tool === "pen") return <SelectionToolBar />;
+  if (tool === "marquee" || tool === "lasso" || tool === "wand" || tool === "pen" || tool === "colorrange") return <SelectionToolBar />;
 
   if (tool === "brush") {
     return (
@@ -241,6 +302,10 @@ export function OptionsBar() {
     );
   }
 
+  if (tool === "bgpick") {
+    return <PickBar />;
+  }
+
   if (tool === "eyedropper") {
     return (
       <div className="optionsbar">
@@ -263,11 +328,60 @@ export function OptionsBar() {
       <button className="btn sm" onClick={() => st().zoomAt(1)}>100%</button>
       <span className="opt-label" style={{ fontVariantNumeric: "tabular-nums" }}>{Math.round(zoom * 100)}%</span>
       <span className="opt-sep" />
+      {hasSel ? (
+        // 선택 영역이 있으면 어느 도구에서든 지우기·남기기 버튼이 보이게 (누끼 탭의 '직접 따기' 묶음을 대신함)
+        <SelActions />
+      ) : (
+        <span className="opt-hint">
+          {tool === "zoom"
+            ? "클릭하면 확대 · Alt+클릭하면 축소"
+            : "드래그로 이동 · 휠로 확대/축소 · 더블클릭하면 화면 맞춤 · 어느 도구에서든 Space를 누르고 드래그하면 이동"}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** 배경 찍기 도구 막대 */
+function PickBar() {
+  const n = useStore((s) => s.doc.cutout?.seeds?.length ?? 0);
+  const busy = useStore((s) => !!s.job);
+  const setTool = useStore((s) => s.setTool);
+  return (
+    <div className="optionsbar">
+      <Title icon={<MousePointerClick size={16} />}>배경 찍기</Title>
       <span className="opt-hint">
-        {tool === "zoom"
-          ? "클릭하면 확대 · Alt+클릭하면 축소"
-          : "드래그로 이동 · 휠로 확대/축소 · 더블클릭하면 화면 맞춤 · 어느 도구에서든 Space를 누르고 드래그하면 이동"}
+        {busy ? "지우는 중…" : "지울 배경을 클릭하세요 · 찍은 곳과 이어진 배경만 지워요 · 고리 안쪽 같은 구멍도 클릭 · Ctrl+Z 되돌리기"}
       </span>
+      <div className="spacer" />
+      {n > 0 && <span className="opt-label">{n}곳 찍음</span>}
+      {n > 0 && <button className="btn sm" onClick={clearCutout}><RotateCcw size={14} /> 처음부터</button>}
+      <button className="btn sm primary" onClick={() => setTool("hand")}><Check size={14} /> 끝</button>
+    </div>
+  );
+}
+
+/** 마술봉 허용치: 끌거나 숫자를 바꾸면 방금 클릭한 영역이 새 허용치로 바로 다시 선택된다 */
+function WandTolerance({ color = false }: { color?: boolean }) {
+  const tol = useStore((s) => (color ? s.wand.colorTol : s.wand.tolerance));
+  const setWand = useStore((s) => s.setWand);
+  const set = (v: number) => {
+    const t = Math.max(0, Math.min(255, Math.round(v) || 0));
+    setWand(color ? { colorTol: t } : { tolerance: t });
+  };
+  const p = (tol / 255) * 100;
+  return (
+    <div className="mini-slider" data-tip="바꾸면 방금 고른 영역에 바로 적용돼요">
+      <span className="opt-label">허용치</span>
+      <input type="range" min={0} max={255} value={tol} style={{ ["--p" as string]: `${p}%` }}
+        onChange={(e) => set(Number(e.target.value))} />
+      <input className="num-input" type="number" min={0} max={255} value={tol}
+        onKeyDown={(e) => {
+          // Enter·Esc: 칸에서 빠져나와 바로 Delete 등을 쓸 수 있게 · Alt+-/= 는 선택 넓히기·줄이기로 넘긴다
+          if (e.key === "Enter" || e.key === "Escape") e.currentTarget.blur();
+          else if (!e.altKey) e.stopPropagation();
+        }}
+        onChange={(e) => set(Number(e.target.value))} />
     </div>
   );
 }
